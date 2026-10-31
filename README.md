@@ -39,8 +39,10 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 
 **Waking the other chat:**
 
-- **ChatGPT:** the prompt goes into the thread's own queue, through the app's bundled `codex app-server`. `codex://threads/wake/<id>` then makes the desktop app run it.
-- **Claude Code:** a background hook with `asyncRewake` exits 2 when something arrives for that session. It is re-armed on every `Stop` and `SessionStart`, so it survives restarts without the model doing anything.
+- **ChatGPT:** the whole message goes into the thread's own queue, through the app's bundled `codex app-server`. `codex://threads/wake/<id>` then makes the desktop app run it. The user reads both sides in that chat:
+  - each incoming message starts with its sender (`CLAUDE:`) and ends with a fixed line saying it is an agent message, not a user instruction;
+  - after `bridge_advise` or `bridge_send`, the chat is told to write what it sent as its reply.
+- **Claude Code:** a short notice wakes the session, which reads the message with `bridge_receive`. A background hook with `asyncRewake` exits 2 when something arrives for that session. It is re-armed on every `Stop` and `SessionStart`, so it survives restarts without the model doing anything.
 
 **Identity.** The bridge learns which chat is calling from the host itself: `CLAUDE_CODE_SESSION_ID` on the Claude side and `_meta.threadId` on the ChatGPT side. It never relies on the model remembering, so context compaction can't break a link.
 
