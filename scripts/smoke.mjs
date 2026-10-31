@@ -129,14 +129,17 @@ assert.equal(status.chat.id, SESSION);
 assert.equal(status.links.find((l) => l.id === rev.id).active, false, "one-off review link closes after its answer");
 console.log(`5 one-off review ${rev.id}: request with diff → answer back → link closed`);
 
-// 5b. bridge_send goes to the linked chat (and so wakes it); no link, no send
+// 5b. bridge_send goes to the linked chat (and so wakes it); a plain message
+// answered with bridge_advise gets told to use bridge_send; no link, no send
 await call(claude, "bridge_send", { text: "Heads up: I'm also changing the tokenizer." });
 const plain = await deliveredTo(THREAD, /changing the tokenizer/);
 assert.match(plain, /^CLAUDE: Message (m\d+)/);
 assert.match(plain, /not a review request: if it needs a reply, send one with bridge_send \(not bridge_advise\)/);
+const wrongTool = await openai.callTool({ name: "bridge_advise", arguments: { request_id: plain.match(/Message (m\d+)/)[1], verdict: "correct", severity: "nit", note: "ok" }, _meta: asGpt(THREAD) });
+assert.ok(wrongTool.isError && /is a message, not a review request; reply to it with bridge_send/.test(textOf(wrongTool)), textOf(wrongTool));
 const lonely = await openai.callTool({ name: "bridge_send", arguments: { text: "hello?" }, _meta: asGpt("gpt-thread-unlinked") });
 assert.ok(lonely.isError && /no active link/.test(textOf(lonely)));
-console.log("5b bridge_send reaches the linked chat; refused without a link");
+console.log("5b bridge_send reaches the linked chat, bridge_advise on it points to bridge_send; refused without a link");
 
 // 5c. a review asked from the ChatGPT side never attaches some other project's changes
 const gptRev = (await call(openai, "bridge_review", { reviewer: "join", request: "Sanity-check my plan." }, asGpt(THREAD))).structuredContent;

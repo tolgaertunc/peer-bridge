@@ -107,7 +107,7 @@ export function wakeText(m) {
     return `[PEER-BRIDGE] Your advisor (${m.from}) flagged your last turn: ${m.id} (link ${m.linkId}). Call bridge_receive to read it, then address it or explain why not.`;
   if (m.kind === "review-result")
     return `[PEER-BRIDGE] The review you asked for is ready: ${m.id} (link ${m.linkId}) from ${m.from}. Call bridge_receive to read it.`;
-  return `[PEER-BRIDGE] New message ${m.id} from ${m.from} is waiting. Call bridge_receive to read it, then act on it per the bridge task.`;
+  return `[PEER-BRIDGE] New message ${m.id} from ${m.from} is waiting. Call bridge_receive to read it. ${nextStep(m)}`;
 }
 
 // What to do with a message, by kind. A plain message is not a review
@@ -413,6 +413,10 @@ class BrokerState {
     let req;
     if (requestId) {
       req = open.find((m) => m.id === requestId);
+      const other = !req && this.s.messages.find((m) => m.id === requestId && sameEndpoint(m.toEndpoint, endpoint));
+      if (other && other.kind !== "review-request")
+        throw new Error(`${requestId} is a ${other.kind}, not a review request; reply to it with bridge_send`);
+      if (other?.answeredAt) throw new Error(`review request ${requestId} is already answered`);
       if (!req) throw new Error(`no open review request ${requestId} for this chat (open: ${open.map((m) => m.id).join(", ") || "none"})`);
     } else if (open.length > 1) {
       throw new Error(`several review requests are open (${open.map((m) => m.id).join(", ")}); pass request_id`);

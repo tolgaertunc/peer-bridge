@@ -71,7 +71,7 @@ server.registerTool(
       ? "Review it and answer with bridge_advise (not bridge_send), once per request, passing its id as request_id."
       : r.messages.some((m) => m.kind === "advisory" || m.kind === "review-result")
         ? "Weigh it, act on what holds up, and tell the user what you changed or why you didn't."
-        : "If a reply to the peer is warranted, send it with bridge_send.";
+        : "These are messages, not review requests: if a reply is warranted, send it with bridge_send (not bridge_advise).";
     return text(`${PEER_RULES}\n\n${body}\n\n${next}`);
   },
 );
@@ -238,7 +238,8 @@ server.registerTool(
   {
     title: "Send advice to the primary",
     description:
-      "Advisor/reviewer only: answer a review request. Call exactly once per request, with its id as request_id, then write the text it returns as your reply.",
+      "Advisor/reviewer only: answer a review request. Call exactly once per request, with its id as request_id, then write the text it returns as your reply. " +
+      "A plain message (kind=message) is not a review request: answer it with bridge_send.",
     inputSchema: {
       request_id: z.string().optional().describe("Id of the review request you answer (e.g. m9); required when several are open"),
       verdict: z.enum(["correct", "incorrect", "unclear"]).describe("Is the primary's turn correct overall?"),

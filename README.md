@@ -69,7 +69,7 @@ Repeated notes are dropped. A one-off review always sends its answer back, then 
 | `bridge_link` | Make this chat a primary whose every turn is reviewed. From Claude, `advisor="openai"` creates a new ChatGPT advisor thread, running read-only, where you can pick the `model` and reasoning `effort`. `advisor="join"` returns a code that any existing chat can use. |
 | `bridge_review` | Ask for a one-off review of a `request`. The chat's own uncommitted changes are attached; on the ChatGPT side they are attached only when the project folder is known. From Claude, `reviewer="openai"` opens a new ChatGPT thread (for example `model="gpt-6-luna"`, `effort="high"`). `reviewer="join"` returns a code. The answer arrives as a new turn. |
 | `bridge_link_join` | Become the advisor or reviewer of a link, using its code. |
-| `bridge_advise` | The advisor's or reviewer's structured answer. It names the request it answers (`request_id`), so a chat serving several links can't mix them up. |
+| `bridge_advise` | The advisor's or reviewer's structured answer. It names the request it answers (`request_id`), so a chat serving several links can't mix them up. A plain message isn't a review request: it is answered with `bridge_send`. |
 | `bridge_unlink` | Close this chat's links. |
 | `bridge_status` | Show this chat's links, their health, whether Claude sides are listening, and pending notes. |
 | `bridge_receive` / `bridge_send` | Read incoming messages. `bridge_send` sends a free-form message to the chat on the other end of this chat's latest link, which is woken to read it. |
