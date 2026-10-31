@@ -238,10 +238,13 @@ class BrokerState {
     fs.renameSync(tmp, STATE_FILE);
   }
 
-  handle(op, a) {
+  handle(op, a, outboxFile) {
     const fn = this["op_" + op];
     if (!fn) throw new Error(`unknown op: ${op}`);
     const result = fn.call(this, a);
+    // saved with the change it made, so an owner that dies before removing
+    // the file doesn't apply it twice after a takeover
+    if (outboxFile) this.s.outboxDone = [...(this.s.outboxDone ?? []), outboxFile].slice(-500);
     this.save();
     this.dispatch();
     return result;
@@ -259,7 +262,8 @@ class BrokerState {
       const file = path.join(OUTBOX_DIR, f);
       try {
         const { op, args } = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (OUTBOX_OPS.has(op)) this.handle(op, args ?? {});
+        if (this.s.outboxDone?.includes(f)) logEvent({ op: "outbox-replay-skipped", file: f });
+        else if (OUTBOX_OPS.has(op)) this.handle(op, args ?? {}, f);
         else logEvent({ op: "outbox-rejected", file: f, requested: op });
       } catch (e) {
         logEvent({ op: "outbox-error", file: f, error: String(e.message || e) });

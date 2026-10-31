@@ -439,15 +439,27 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 
 // 22. telling the bridge's prompts from the user's: exact text, once per
 // delivery, so the same text again is the user's; a delivery still being sent
-// already counts, and "sending" is on disk before the thread can run it
+// already counts, and "sending" is on disk before the thread can run it. Hook
+// events are applied once, even when an owner that died before removing one
+// leaves it for the next owner.
 {
   const P = { app: "openai", id: "gpt-detect" };
   const A = { app: "claude", id: "claude-detect-advisor" };
   const l = await call("link_create", { primary: P, advisor: A });
   const gen = () => state().links[l.id].generation;
-  await call("turn_start", { endpoint: P, prompt: "Start." });
-  assert.equal(gen(), 1);
-  await call("turn_end", { endpoint: P, lastMessage: "done" });
+  // a prompt and a Stop without turn ids (as Claude's are), each left in the
+  // outbox twice under the same name: applied once
+  const replay = async (name, op, args) => {
+    for (let i = 0; i < 2; i++) {
+      fs.writeFileSync(path.join(dir, "outbox", name), JSON.stringify({ op, args }));
+      await until(() => !fs.existsSync(path.join(dir, "outbox", name)));
+    }
+  };
+  await replay("0000000000001-1-aaaaaa.json", "turn_start", { endpoint: P, prompt: "Start." });
+  assert.equal(gen(), 1, "a user prompt's event applied twice counts once");
+  await replay("0000000000002-1-bbbbbb.json", "turn_end", { endpoint: P, lastMessage: "done" });
+  assert.equal(state().messages.filter((m) => m.kind === "review-request" && m.linkId === l.id).length, 1, "a replayed Stop is one review, not two rounds");
+  assert.ok(events().some((e) => e.op === "outbox-replay-skipped" && e.file === "0000000000002-1-bbbbbb.json"));
   const req = state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id);
   process.env.PEER_BRIDGE_FAKE_CODEX = "slow";
   const adv = await call("advise", { endpoint: A, requestId: req.id, decision: "changes_requested", blocking: [{ title: "no" }] });
@@ -470,7 +482,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
     assert.equal((await call("link_continue", { primary: RQ, roundOf: prev.id, request: "y" })).round, 2, `cap "${bad}" falls back to 20`);
   }
   delete process.env.PEER_BRIDGE_MAX_ROUNDS;
-  console.log("22 bridge prompts: exact text, once per delivery, counted while still sending; a bad cap falls back to 20");
+  console.log("22 bridge prompts: exact text, once per delivery, counted while still sending; hook events applied once; a bad cap falls back to 20");
 }
 
 // 23. an owner that takes over doesn't resend a delivery whose turn already
