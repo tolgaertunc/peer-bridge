@@ -129,6 +129,14 @@ assert.equal(status.chat.id, SESSION);
 assert.equal(status.links.find((l) => l.id === rev.id).active, false, "one-off review link closes after its answer");
 console.log(`5 one-off review ${rev.id}: request with diff → answer back → link closed`);
 
+// 5a. the next review continues in the same ChatGPT thread (no new thread)
+const again = (await call(claude, "bridge_review", { reviewer: "openai", thread_id: REVIEWER, include_diff: false, request: "And now with quotes handled?" })).structuredContent;
+assert.equal(again.threadId, REVIEWER);
+const againReq = await deliveredTo(REVIEWER, /And now with quotes handled\?/);
+await call(openai, "bridge_advise", { request_id: againReq.match(/Review request (m\d+)/)[1], verdict: "correct", severity: "none", note: "" }, asGpt(REVIEWER));
+assert.match(await receiveUntil(claude, undefined, /kind=review-result/), /severity: none/);
+console.log(`5a review ${again.id} continued in the earlier reviewer thread`);
+
 // 5b. bridge_send goes to the linked chat (and so wakes it); a plain message
 // answered with bridge_advise gets told to use bridge_send; no link, no send
 await call(claude, "bridge_send", { text: "Heads up: I'm also changing the tokenizer." });

@@ -168,7 +168,7 @@ server.registerTool(
       "Get an independent review from a chat in the other app, once (for review on every turn use bridge_link). " +
       "Write in `request` what to review and what you want to know; uncommitted changes in the project are attached by default. " +
       (SIDE === "claude"
-        ? "reviewer='openai' opens a new ChatGPT thread for it (pick the model, e.g. gpt-6-luna); "
+        ? "reviewer='openai' opens a new ChatGPT thread for it (pick the model, e.g. gpt-6-luna), or continues in an earlier one (thread_id), which keeps that chat's context; "
         : "") +
       "reviewer='join' returns a code for an existing chat, which then calls bridge_link_join. The answer arrives as a new turn.",
     inputSchema: {
@@ -178,10 +178,16 @@ server.registerTool(
       effort: z.string().optional().describe("Reasoning effort for a new ChatGPT reviewer thread, e.g. low, medium, high"),
       include_diff: z.boolean().optional().describe("Attach uncommitted changes (default true)"),
       name: z.string().optional().describe("Name for a new reviewer thread"),
+      ...(SIDE === "claude" && {
+        thread_id: z
+          .string()
+          .optional()
+          .describe("Existing ChatGPT thread to review in, e.g. an earlier reviewer's; it keeps its own model and permissions (model/effort/name are ignored)"),
+      }),
     },
     annotations: LOCAL,
   },
-  async ({ request, reviewer, model, effort, include_diff = true, name }, extra) => {
+  async ({ request, reviewer, model, effort, include_diff = true, name, thread_id }, extra) => {
     const primary = await endpointOf(SIDE, extra);
     if (!primary) return text("Can't tell which chat this is, so the review can't be routed back.");
     const req = reviewRequest(request, include_diff, extra);
@@ -189,10 +195,17 @@ server.registerTool(
       const r = await call("link_create", { primary, mode: "review", request: req });
       return text(`Review ${r.id} is waiting for a reviewer. In the chat that should review (either app), ask it to call bridge_link_join with code ${r.joinCode}.`, r);
     }
-    const { createThread } = await import("./codex.mjs");
-    const { threadId } = await createThread({ model, effort, name: name ?? `Peer bridge · Review: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF, sandbox: "read-only" });
+    let threadId = thread_id;
+    if (!threadId) {
+      const { createThread } = await import("./codex.mjs");
+      threadId = (await createThread({ model, effort, name: name ?? `Peer bridge · Review: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF, sandbox: "read-only" })).threadId;
+    }
     const r = await call("link_create", { primary, mode: "review", advisor: { app: "openai", id: threadId }, request: req });
-    return text(`Review ${r.id} sent to a new ChatGPT thread (${threadId}${model ? `, ${model}` : ""}${effort ? `, effort ${effort}` : ""}). The answer arrives as a new turn when it's ready.`, { ...r, threadId });
+    const where = thread_id ? `ChatGPT thread ${threadId}` : `a new ChatGPT thread (${threadId}${model ? `, ${model}` : ""}${effort ? `, effort ${effort}` : ""})`;
+    return text(
+      `Review ${r.id} sent to ${where}. The answer arrives as a new turn when it's ready. To continue in that chat later, pass thread_id ${threadId}.`,
+      { ...r, threadId },
+    );
   },
 );
 
