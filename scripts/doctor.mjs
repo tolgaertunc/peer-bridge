@@ -9,7 +9,7 @@ import path from "node:path";
 import http from "node:http";
 import { execFileSync, spawnSync } from "node:child_process";
 import { DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, PROTOCOL, readState, activeLinks } from "../src/broker.mjs";
-import { IS_WIN, IS_MAC, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli, findCodexCli } from "../src/platform.mjs";
+import { IS_WIN, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli, locateCodexCli } from "../src/platform.mjs";
 
 const asJson = process.argv.includes("--json");
 const root = path.resolve(import.meta.dirname, "..");
@@ -35,7 +35,6 @@ const REINSTALL = "Run `node scripts/install.mjs` from this checkout, then resta
   } catch {
     warn(A, "git", "not found", "Install git; without it review requests carry no diffs.");
   }
-  if (IS_MAC) warn(A, "macOS", "supported by design, not yet verified on a Mac", "Report what fails.");
 }
 
 // ------------------------------------------------------------------ broker
@@ -178,8 +177,12 @@ function runs(cmd, shell) {
 // --------------------------------------------------------- ChatGPT Desktop
 {
   const A = "ChatGPT Desktop";
-  const cli = findCodexCli();
-  cli ? ok(A, "bundled codex", cli) : fail(A, "bundled codex", "not found", "Install ChatGPT Desktop, or set PEER_BRIDGE_CODEX_BIN.");
+  const codex = locateCodexCli();
+  const cli = codex?.path ?? null;
+  if (!codex) fail(A, "bundled codex", "not found", "Install ChatGPT Desktop, or set PEER_BRIDGE_CODEX_BIN.");
+  else if (codex.source === "app") ok(A, "bundled codex", cli);
+  else if (codex.source === "override") ok(A, "bundled codex", `${cli} (set by PEER_BRIDGE_CODEX_BIN)`);
+  else warn(A, "bundled codex", `not found, using ${cli} from PATH`, "Its version can differ from the app's; set PEER_BRIDGE_CODEX_BIN to the app's own codex.");
   const cfgFile = path.join(codexHome(), "config.toml");
   const toml = fs.existsSync(cfgFile) ? fs.readFileSync(cfgFile, "utf8") : "";
   const block = toml.match(/# >>> peer-bridge[\s\S]*?# <<< peer-bridge/)?.[0];

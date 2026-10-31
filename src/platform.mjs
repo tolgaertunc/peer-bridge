@@ -1,7 +1,8 @@
 // Everything that differs between Windows, macOS and Linux lives here: where
 // the apps keep their config, where their bundled CLIs are, and how to open a
-// deep link. macOS locations are from the apps' documented layouts and still
-// need checking on a real Mac. Each lookup has an env override for odd installs.
+// deep link. macOS locations were checked on a Mac (ChatGPT 26.1027, Claude
+// Code 2.1.309 bundled with Claude Desktop). Each lookup has an env override
+// for odd installs.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -70,26 +71,48 @@ function newestIn(root, depth, file) {
 
 const firstExisting = (paths) => paths.find((p) => p && fs.existsSync(p)) ?? null;
 
-// Claude Code CLI: a standalone install, or the copy bundled with Claude Desktop
+// Claude Code CLI: a standalone install, or the copy bundled with Claude
+// Desktop (<version>/<hash>/claude.exe on Windows, .../claude.app on macOS)
 export function findClaudeCli() {
   if (process.env.PEER_BRIDGE_CLAUDE_BIN) return process.env.PEER_BRIDGE_CLAUDE_BIN;
   const bundled = IS_WIN ? path.join(winAppData(), "Claude", "claude-code") : IS_MAC ? path.join(macAppSupport, "Claude", "claude-code") : null;
-  return onPath("claude") ?? (bundled && newestIn(bundled, 2, exe("claude"))) ?? process.env.CLAUDE_CODE_EXECPATH ?? null;
+  const file = IS_MAC ? path.join("claude.app", "Contents", "MacOS", "claude") : exe("claude");
+  return onPath("claude") ?? (bundled && newestIn(bundled, 2, file)) ?? process.env.CLAUDE_CODE_EXECPATH ?? null;
 }
 
-// Codex CLI bundled with ChatGPT Desktop (the app server API we drive)
-export function findCodexCli() {
-  if (process.env.PEER_BRIDGE_CODEX_BIN) return process.env.PEER_BRIDGE_CODEX_BIN;
-  if (IS_WIN) {
-    const bundled = newestIn(path.join(winLocalAppData(), "OpenAI", "Codex", "bin"), 1, "codex.exe");
-    if (bundled) return bundled;
+// Codex CLI bundled with ChatGPT Desktop (the app server API we drive), and
+// where it came from: "override" (PEER_BRIDGE_CODEX_BIN), "app", or "path". A
+// codex on PATH is a separate install whose version can differ from the app's.
+export function locateCodexCli() {
+  if (process.env.PEER_BRIDGE_CODEX_BIN) return { path: process.env.PEER_BRIDGE_CODEX_BIN, source: "override" };
+  const app = IS_WIN
+    ? newestIn(path.join(winLocalAppData(), "OpenAI", "Codex", "bin"), 1, "codex.exe")
+    : IS_MAC
+      ? codexInMacApps(["/Applications", path.join(home, "Applications")])
+      : null;
+  if (app) return { path: app, source: "app" };
+  const found = onPath("codex");
+  return found ? { path: found, source: "path" } : null;
+}
+
+export const findCodexCli = () => locateCodexCli()?.path ?? null;
+
+// ChatGPT.app first: the queue we drive is ChatGPT Desktop's. Current builds
+// ship the CLI in Resources/codex-cli, described by codex-package.json; older
+// ones as Resources/codex.
+export function codexInMacApps(dirs) {
+  const resources = ["ChatGPT.app", "Codex.app"].flatMap((app) => dirs.map((d) => path.join(d, app, "Contents", "Resources")));
+  return firstExisting(resources.flatMap((r) => [codexEntrypoint(path.join(r, "codex-cli")), path.join(r, "codex")]));
+}
+
+function codexEntrypoint(dir) {
+  try {
+    const entry = JSON.parse(fs.readFileSync(path.join(dir, "codex-package.json"), "utf8")).entrypoint;
+    if (typeof entry === "string" && entry) return path.join(dir, entry);
+  } catch {
+    // no manifest: fall back to the layout it describes today
   }
-  if (IS_MAC) {
-    const apps = ["Codex.app", "ChatGPT.app"].flatMap((a) => [path.join("/Applications", a), path.join(home, "Applications", a)]);
-    const bundled = firstExisting(apps.map((a) => path.join(a, "Contents", "Resources", "codex")));
-    if (bundled) return bundled;
-  }
-  return onPath("codex");
+  return path.join(dir, "bin", "codex");
 }
 
 // Hand a URL (codex://…) to the OS protocol handler
