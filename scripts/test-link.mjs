@@ -83,8 +83,9 @@ await until(() => events().find((e) => e.op === "fake-codex-deliver" && e.thread
 console.log(`2 Claude→GPT review request ${req.id} (question + answer) queued by Stop (${r.ms} ms), delivered to the GPT thread`);
 
 // 3. GPT receives and advises a concern → Claude's listener wakes it (exit 2)
-const got = await call("receive", { side: "openai", endpoint: GPT });
-assert.equal(got.messages[0].kind, "review-request");
+// the thread got the whole request, so there is nothing left to receive
+await until(() => state().messages.find((m) => m.id === req.id)?.readAt);
+assert.equal((await call("receive", { side: "openai", endpoint: GPT })).messages.length, 0);
 const listener = runHook("claude", "listen", { session_id: CLAUDE.id });
 await sleep(1500);
 const adv = await call("advise", { endpoint: GPT, verdict: "incorrect", severity: "concern", note: "Parser drops the last token." });
@@ -299,6 +300,41 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   owner.kill();
   assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /Couldn't hand review-request .* ChatGPT Desktop not reachable/);
   console.log("15 failed delivery shown to the primary with its next prompt; week-old state pruned on load");
+}
+
+// 18. a review request handed to a ChatGPT thread counts as read, but stays
+// answerable until answered: not pruned after a day, nor by the read cap
+{
+  const dir4 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-open-"));
+  const P = { app: "claude", id: "claude-slow" };
+  const G = { app: "openai", id: "gpt-slow" };
+  const old = Date.now() - 2 * 24 * 3600_000;
+  const msg = (id, extra) => ({ id, from: "claude", to: "openai", toEndpoint: G, linkId: "L1", text: "x", ts: Date.now(), readAt: Date.now(), dispatch: { state: "sent", at: Date.now() }, ...extra });
+  const seeded = {
+    seq: 700, linkSeq: 1, notes: [],
+    links: { L1: { id: "L1", mode: "advisor", active: true, createdAt: old, primary: P, advisor: G, reviews: 1, advisories: [] } },
+    messages: [msg("m1", { kind: "review-request", ts: old, readAt: old }), ...Array.from({ length: 600 }, (_, i) => msg(`m${i + 2}`, { kind: "message" }))],
+  };
+  try {
+    fs.writeFileSync(path.join(dir4, "state.json"), JSON.stringify(seeded));
+    const env4 = { ...process.env, PEER_BRIDGE_DIR: dir4, PEER_BRIDGE_PORT: "7494" };
+    const out = await new Promise((resolve) => {
+      const p = spawn(process.execPath, ["--input-type=module", "-e",
+        `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");` +
+        `try{console.log(JSON.stringify(await b.call("advise",{endpoint:${JSON.stringify(G)},requestId:"m1",verdict:"incorrect",severity:"concern",note:"still answerable"})))}catch(e){console.log(JSON.stringify({error:e.message}))}process.exit(0);`], { env: env4 });
+      let o = "";
+      p.stdout.on("data", (d) => (o += d));
+      p.on("close", () => resolve(o));
+    });
+    const res = JSON.parse(out);
+    assert.equal(res.error, undefined, res.error);
+    assert.equal(res.delivered, "now");
+    const kept = JSON.parse(fs.readFileSync(path.join(dir4, "state.json"), "utf8")).messages.filter((m) => m.kind === "message").length;
+    assert.ok(kept <= 500, `read messages still capped (kept ${kept})`);
+    console.log("18 a day-old review request already handed to ChatGPT is still answerable; read messages still capped");
+  } finally {
+    fs.rmSync(dir4, { recursive: true, force: true });
+  }
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));

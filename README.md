@@ -39,8 +39,10 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 
 **Waking the other chat:**
 
-- **ChatGPT:** the prompt goes into the thread's own queue, through the app's bundled `codex app-server`. `codex://threads/wake/<id>` then makes the desktop app run it.
-- **Claude Code:** a background hook with `asyncRewake` exits 2 when something arrives for that session. It is re-armed on every `Stop` and `SessionStart`, so it survives restarts without the model doing anything.
+- **ChatGPT:** the whole message goes into the thread's own queue, through the app's bundled `codex app-server`. `codex://threads/wake/<id>` then makes the desktop app run it. The user reads both sides in that chat:
+  - each incoming message starts with its sender (`CLAUDE:`) and ends with a fixed line saying it is an agent message, not a user instruction;
+  - after `bridge_advise` or `bridge_send`, the chat is told to write what it sent as its reply.
+- **Claude Code:** a short notice wakes the session, which reads the message with `bridge_receive`. A background hook with `asyncRewake` exits 2 when something arrives for that session. It is re-armed on every `Stop` and `SessionStart`, so it survives restarts without the model doing anything.
 
 **Identity.** The bridge learns which chat is calling from the host itself: `CLAUDE_CODE_SESSION_ID` on the Claude side and `_meta.threadId` on the ChatGPT side. It never relies on the model remembering, so context compaction can't break a link.
 
@@ -65,9 +67,9 @@ Repeated notes are dropped. A one-off review always sends its answer back, then 
 | Tool | Purpose |
 |---|---|
 | `bridge_link` | Make this chat a primary whose every turn is reviewed. From Claude, `advisor="openai"` creates a new ChatGPT advisor thread, running read-only, where you can pick the `model` and reasoning `effort`. `advisor="join"` returns a code that any existing chat can use. |
-| `bridge_review` | Ask for a one-off review of a `request`. The chat's own uncommitted changes are attached; on the ChatGPT side they are attached only when the project folder is known. From Claude, `reviewer="openai"` opens a new ChatGPT thread (for example `model="gpt-6-luna"`, `effort="high"`). `reviewer="join"` returns a code. The answer arrives as a new turn. |
+| `bridge_review` | Ask for a one-off review of a `request`. The chat's own uncommitted changes are attached; on the ChatGPT side they are attached only when the project folder is known. From Claude, `reviewer="openai"` opens a new ChatGPT thread (for example `model="gpt-6-luna"`, `effort="high"`), or continues in an earlier reviewer's thread with `thread_id`, keeping that chat's context. `reviewer="join"` returns a code. The answer arrives as a new turn. |
 | `bridge_link_join` | Become the advisor or reviewer of a link, using its code. |
-| `bridge_advise` | The advisor's or reviewer's structured answer. It names the request it answers (`request_id`), so a chat serving several links can't mix them up. |
+| `bridge_advise` | The advisor's or reviewer's structured answer. It names the request it answers (`request_id`), so a chat serving several links can't mix them up. A plain message isn't a review request: it is answered with `bridge_send`. |
 | `bridge_unlink` | Close this chat's links. |
 | `bridge_status` | Show this chat's links, their health, whether Claude sides are listening, and pending notes. |
 | `bridge_receive` / `bridge_send` | Read incoming messages. `bridge_send` sends a free-form message to the chat on the other end of this chat's latest link, which is woken to read it. |
