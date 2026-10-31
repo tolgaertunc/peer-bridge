@@ -12,7 +12,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { call, keepOwner, SIDES, MAX_DIFF } from "./broker.mjs";
+import { call, keepOwner, SIDES, MAX_DIFF, PLAN_GATE } from "./broker.mjs";
 import { identify, endpointOf } from "./caller.mjs";
 import { turnDiff } from "./git.mjs";
 
@@ -65,14 +65,19 @@ server.registerTool(
     const r = await call("receive", { side: SIDE, endpoint: await endpointOf(SIDE, extra) });
     if (!r.messages.length) return text("No unread peer messages.");
     const body = r.messages
-      .map((m) => `[PEER from=${m.from} id=${m.id}${m.kind ? ` kind=${m.kind}` : ""}${m.linkId ? ` link=${m.linkId}` : ""}]\n${m.text}\n[/PEER]`)
+      .map((m) => `[PEER from=${m.from} id=${m.id}${m.kind ? ` kind=${m.kind}` : ""}${m.plan ? " plan" : ""}${m.linkId ? ` link=${m.linkId}` : ""}]\n${m.text}\n[/PEER]`)
       .join("\n\n");
-    const next = r.messages.some((m) => m.kind === "review-request")
-      ? "Review it and answer with bridge_advise (not bridge_send), once per request, passing its id as request_id."
-      : r.messages.some((m) => m.kind === "advisory" || m.kind === "review-result")
-        ? "Weigh it, act on what holds up, and tell the user what you changed or why you didn't."
-        : "These are messages, not review requests: if a reply is warranted, send it with bridge_send (not bridge_advise).";
-    return text(`${PEER_RULES}\n\n${body}\n\n${next}`);
+    // one instruction per kind of message received, so a mixed batch keeps
+    // them all (the plan gate above all)
+    const has = (fn) => r.messages.some(fn);
+    const next = [
+      has((m) => m.kind === "review-request") && "Review requests: answer each with bridge_advise (not bridge_send), once, passing its id as request_id.",
+      has((m) => m.kind === "review-result" && m.plan) && PLAN_GATE,
+      has((m) => m.kind === "advisory" || (m.kind === "review-result" && !m.plan)) &&
+        "Advice and reviews: weigh them, act on what holds up, and tell the user what you changed or why you didn't.",
+      has((m) => m.kind === "message") && "Messages are not review requests: if a reply is warranted, send it with bridge_send (not bridge_advise).",
+    ].filter(Boolean);
+    return text(`${PEER_RULES}\n\n${body}\n\n${next.join("\n")}`);
   },
 );
 
@@ -142,12 +147,20 @@ const REVIEWER_BRIEF =
 // of the calling chat's own project. A Claude server belongs to one session
 // (CLAUDE_PROJECT_DIR); the ChatGPT server is shared by all threads, so only
 // a folder the call itself names is used there, never the server's cwd.
-function reviewRequest(request, includeDiff, extra) {
+function reviewRequest(request, includeDiff, extra, plan) {
   const cwd = SIDE === "claude" ? process.env.CLAUDE_PROJECT_DIR : codexTurnCwd(extra);
   const diff = includeDiff && cwd ? turnDiff(cwd, null, MAX_DIFF) : null;
   const missing = includeDiff && !cwd ? "(Uncommitted changes not attached: this chat's project folder is unknown.)" : null;
-  return [`Review requested by ${SIDE}:`, request.trim(), diff && `Uncommitted changes in ${cwd}:\n${diff}`, missing].filter(Boolean).join("\n\n");
+  return [plan ? `Plan review requested by ${SIDE}:` : `Review requested by ${SIDE}:`, request.trim(), plan && PLAN_GUIDE, diff && `Uncommitted changes in ${cwd}:\n${diff}`, missing]
+    .filter(Boolean)
+    .join("\n\n");
 }
+
+// What a plan is reviewed for, sent with the plan (the reviewer thread may be
+// one that was briefed for code)
+const PLAN_GUIDE =
+  "This is a plan, not finished work: review it before anything is built. Check that it reaches the stated goal, " +
+  "missing or wrongly ordered steps, risks and what could break, simpler alternatives, scope creep, and how the result will be checked.";
 
 function codexTurnCwd(extra) {
   let m = extra?._meta?.["x-codex-turn-metadata"];
@@ -167,6 +180,7 @@ server.registerTool(
     description:
       "Get an independent review from a chat in the other app, once (for review on every turn use bridge_link). " +
       "Write in `request` what to review and what you want to know; uncommitted changes in the project are attached by default. " +
+      "For a plan (before implementing), use kind='plan': no changes are attached unless include_diff is set, and once it's reviewed you show the user the plan and verdict and wait for their approval. " +
       (SIDE === "claude"
         ? "reviewer='openai' opens a new ChatGPT thread for it (pick the model, e.g. gpt-6-luna), or continues in an earlier one (thread_id), which keeps that chat's context; "
         : "") +
@@ -176,7 +190,8 @@ server.registerTool(
       reviewer: z.enum(SIDE === "claude" ? ["openai", "join"] : ["join"]).describe("Where the reviewer runs"),
       model: z.string().optional().describe("Model for a new ChatGPT reviewer thread"),
       effort: z.string().optional().describe("Reasoning effort for a new ChatGPT reviewer thread, e.g. low, medium, high"),
-      include_diff: z.boolean().optional().describe("Attach uncommitted changes (default true)"),
+      kind: z.enum(["code", "plan"]).optional().describe("What is reviewed: code (default) or a plan before implementing it"),
+      include_diff: z.boolean().optional().describe("Attach uncommitted changes (default true for code, false for a plan)"),
       name: z.string().optional().describe("Name for a new reviewer thread"),
       ...(SIDE === "claude" && {
         thread_id: z
@@ -187,23 +202,25 @@ server.registerTool(
     },
     annotations: LOCAL,
   },
-  async ({ request, reviewer, model, effort, include_diff = true, name, thread_id }, extra) => {
+  async ({ request, reviewer, model, effort, kind = "code", include_diff, name, thread_id }, extra) => {
     const primary = await endpointOf(SIDE, extra);
     if (!primary) return text("Can't tell which chat this is, so the review can't be routed back.");
-    const req = reviewRequest(request, include_diff, extra);
+    const plan = kind === "plan";
+    const req = reviewRequest(request, include_diff ?? !plan, extra, plan);
+    const what = plan ? "Plan review" : "Review";
     if (reviewer === "join") {
-      const r = await call("link_create", { primary, mode: "review", request: req });
-      return text(`Review ${r.id} is waiting for a reviewer. In the chat that should review (either app), ask it to call bridge_link_join with code ${r.joinCode}.`, r);
+      const r = await call("link_create", { primary, mode: "review", request: req, plan });
+      return text(`${what} ${r.id} is waiting for a reviewer. In the chat that should review (either app), ask it to call bridge_link_join with code ${r.joinCode}.`, r);
     }
     let threadId = thread_id;
     if (!threadId) {
       const { createThread } = await import("./codex.mjs");
-      threadId = (await createThread({ model, effort, name: name ?? `Peer bridge · Review: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF, sandbox: "read-only" })).threadId;
+      threadId = (await createThread({ model, effort, name: name ?? `Peer bridge · ${what}: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF, sandbox: "read-only" })).threadId;
     }
-    const r = await call("link_create", { primary, mode: "review", advisor: { app: "openai", id: threadId }, request: req });
+    const r = await call("link_create", { primary, mode: "review", advisor: { app: "openai", id: threadId }, request: req, plan });
     const where = thread_id ? `ChatGPT thread ${threadId}` : `a new ChatGPT thread (${threadId}${model ? `, ${model}` : ""}${effort ? `, effort ${effort}` : ""})`;
     return text(
-      `Review ${r.id} sent to ${where}. The answer arrives as a new turn when it's ready. To continue in that chat later, pass thread_id ${threadId}.`,
+      `${what} ${r.id} sent to ${where}. The answer arrives as a new turn when it's ready. To continue in that chat later, pass thread_id ${threadId}.`,
       { ...r, threadId },
     );
   },
@@ -223,7 +240,7 @@ server.registerTool(
     const r = await call("link_join", { code: code.trim(), endpoint });
     if (r.mode === "review")
       return text(
-        `Joined review ${r.id} for ${r.primary.app} chat ${r.primary.id}. ` +
+        `Joined ${r.plan ? "plan review" : "review"} ${r.id} for ${r.primary.app} chat ${r.primary.id}. ` +
           (SIDE === "openai" ? "Its request arrives as the next message in this chat." : "Its request is waiting: call bridge_receive now.") +
           `\n\n${REVIEWER_BRIEF}`,
         r,
