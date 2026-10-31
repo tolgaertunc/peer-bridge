@@ -12,10 +12,12 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { call, keepOwner, SIDES, MAX_DIFF, nextStep } from "./broker.mjs";
+import { call, keepOwner, SIDES, MAX_DIFF, HOST_ID, nextStep } from "./broker.mjs";
 import { identify, endpointOf } from "./caller.mjs";
 import { turnDiff } from "./git.mjs";
 import { rulesBlock } from "./rules.mjs";
+import { readConfig, writeConfig } from "./config.mjs";
+import { chatgptRunning, openChatgpt, openUrl } from "./platform.mjs";
 
 const sideArg = process.argv.indexOf("--side");
 const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.PEER_BRIDGE_SIDE;
@@ -42,6 +44,52 @@ const withRules = (t, structuredContent, { first = false } = {}) => {
   return text(!rules ? t : first ? `${rules}\n\n${t}` : `${t}\n\n${rules}`, structuredContent);
 };
 
+// The calling chat. A Claude server that belongs to that session also
+// reports Claude Desktop's id for it, so the session can be opened later.
+let hostReported = false;
+async function self(extra) {
+  const endpoint = await endpointOf(SIDE, extra);
+  const hostId = process.env.CLAUDE_CODE_HOST_SESSION_ID;
+  if (!hostReported && SIDE === "claude" && endpoint?.id === process.env.CLAUDE_CODE_SESSION_ID && HOST_ID.test(hostId ?? "")) {
+    hostReported = true;
+    await call("host", { endpoint, hostId }).catch(() => (hostReported = false));
+  }
+  return endpoint;
+}
+
+// Before a call that reaches the other side: if it's closed, nothing is sent
+// unless the user agreed (open=true, or openClosedApps "always"); then it is
+// opened first. Returns a tool result to stop with, or null to go on.
+async function reach(target, { open, remember }) {
+  if (open && remember) writeConfig({ openClosedApps: "always" });
+  if (!target) return null;
+  const isOpen = target.app === "openai" ? chatgptRunning() === true : (await call("reach", { endpoint: target })).listening;
+  if (isOpen) return null;
+  const what = target.app === "openai" ? "ChatGPT Desktop" : `the Claude Code session ${target.id}`;
+  if (!open && readConfig().openClosedApps !== "always")
+    return text(
+      `Nothing was sent: ${what} isn't open. Ask the user whether to open it. If they agree, call this tool again with the same arguments and open=true; ` +
+        "add remember=true only if they also say to always do this.",
+    );
+  try {
+    if (target.app === "openai") openChatgpt();
+    else {
+      const { hostId } = await call("reach", { endpoint: target });
+      if (!hostId) return text(`Nothing was sent: the bridge doesn't know how to open ${what}. Ask the user to open it in Claude Desktop, then try again.`);
+      openUrl(`claude://code/continue?session=${hostId}`);
+    }
+  } catch (e) {
+    return text(`Nothing was sent: opening ${what} failed (${e.message || e}). Ask the user to open it, then try again.`);
+  }
+  await call("report", { side: SIDE, event: "opened", data: { target } });
+  return null;
+}
+
+const OPEN_ARGS = {
+  open: z.boolean().optional().describe("Open the other app or chat first if it's closed; pass only after the user agreed"),
+  remember: z.boolean().optional().describe("With open=true: from now on open closed apps without asking; pass only if the user said so"),
+};
+
 const server = new McpServer({ name: "peer-bridge", version: "0.1.0" });
 
 server.registerTool(
@@ -51,11 +99,16 @@ server.registerTool(
     description:
       "Send a free-form message to the chat on the other end of this chat's latest link (bridge_link or bridge_review); it is woken to read it. " +
       "Use bridge_advise, not this, to answer a review request.",
-    inputSchema: { text: z.string().describe("Message for the other chat") },
+    inputSchema: { text: z.string().describe("Message for the other chat"), ...OPEN_ARGS },
     annotations: LOCAL,
   },
-  async ({ text: t }, extra) => {
-    const r = await call("send", { endpoint: await endpointOf(SIDE, extra), text: t });
+  async ({ text: t, open, remember }, extra) => {
+    const endpoint = await self(extra);
+    // sent to the chat that was checked, even if a newer link appears meanwhile
+    const target = await call("send_target", { endpoint });
+    const stop = await reach(target.to, { open, remember });
+    if (stop) return stop;
+    const r = await call("send", { endpoint, text: t, linkId: target.linkId });
     return text(`Sent ${r.id} to ${r.to.app} chat ${r.to.id} (link ${r.linkId}). The user can't see tool calls: write what you sent in your reply.`, r);
   },
 );
@@ -69,7 +122,7 @@ server.registerTool(
     annotations: LOCAL,
   },
   async (_args, extra) => {
-    const r = await call("receive", { side: SIDE, endpoint: await endpointOf(SIDE, extra) });
+    const r = await call("receive", { side: SIDE, endpoint: await self(extra) });
     if (!r.messages.length) return text("No unread peer messages.");
     const body = r.messages
       .map((m) => `[PEER from=${m.from} id=${m.id}${m.kind ? ` kind=${m.kind}` : ""}${m.plan ? " plan" : ""}${m.decision ? ` decision=${m.decision}` : ""}${m.linkId ? ` link=${m.linkId}` : ""}]\n${m.text}\n[/PEER]`)
@@ -113,11 +166,12 @@ server.registerTool(
       effort: z.string().optional().describe("Reasoning effort for a new ChatGPT advisor thread, e.g. low, medium, high"),
       thread_id: z.string().optional().describe("Existing ChatGPT thread to use as advisor"),
       name: z.string().optional().describe("Name for a new advisor thread"),
+      ...OPEN_ARGS,
     },
     annotations: LOCAL,
   },
-  async ({ advisor, model, effort, thread_id, name }, extra) => {
-    const primary = await endpointOf(SIDE, extra);
+  async ({ advisor, model, effort, thread_id, name, open, remember }, extra) => {
+    const primary = await self(extra);
     if (!primary) return text("Can't tell which chat this is, so it can't be linked.");
     if (advisor === "join") {
       const r = await call("link_create", { primary });
@@ -126,6 +180,8 @@ server.registerTool(
         r,
       );
     }
+    const stop = await reach({ app: "openai", id: thread_id ?? null }, { open, remember });
+    if (stop) return stop;
     let threadId = thread_id;
     if (!threadId) {
       const { createThread } = await import("./codex.mjs");
@@ -200,6 +256,7 @@ server.registerTool(
       kind: z.enum(["code", "plan"]).optional().describe("What is reviewed: code (default) or a plan before implementing it"),
       include_diff: z.boolean().optional().describe("Attach uncommitted changes (default true for code, false for a plan)"),
       name: z.string().optional().describe("Name for a new reviewer thread"),
+      ...OPEN_ARGS,
       ...(SIDE === "claude" && {
         thread_id: z
           .string()
@@ -209,12 +266,15 @@ server.registerTool(
     },
     annotations: LOCAL,
   },
-  async ({ request, reviewer, round_of, model, effort, kind, include_diff, name, thread_id }, extra) => {
-    const primary = await endpointOf(SIDE, extra);
+  async ({ request, reviewer, round_of, model, effort, kind, include_diff, name, thread_id, open, remember }, extra) => {
+    const primary = await self(extra);
     if (!primary) return text("Can't tell which chat this is, so the review can't be routed back.");
     if (round_of) {
       // the round's kind comes from the earlier one; the broker refuses a mismatch
       const info = await call("round_info", { primary, roundOf: round_of });
+      // checked before the round is used up
+      const stop = await reach(info.advisor, { open, remember });
+      if (stop) return stop;
       const plan = kind ? kind === "plan" : info.plan;
       const req = reviewRequest(request, include_diff ?? !plan, extra, plan);
       const r = await call("link_continue", { primary, roundOf: round_of, request: req, plan: kind ? plan : undefined, threadId: thread_id });
@@ -228,6 +288,9 @@ server.registerTool(
       const r = await call("link_create", { primary, mode: "review", request: req, plan });
       return withRules(`${what} ${r.id} is waiting for a reviewer. In the chat that should review (either app), ask it to call bridge_link_join with code ${r.joinCode}.`, r);
     }
+    // before a thread or link is made
+    const stop = await reach({ app: "openai", id: thread_id ?? null }, { open, remember });
+    if (stop) return stop;
     let threadId = thread_id;
     if (!threadId) {
       const { createThread } = await import("./codex.mjs");
@@ -251,7 +314,7 @@ server.registerTool(
     annotations: LOCAL,
   },
   async ({ code }, extra) => {
-    const endpoint = await endpointOf(SIDE, extra);
+    const endpoint = await self(extra);
     if (!endpoint) return text("Can't tell which chat this is, so it can't join.");
     const r = await call("link_join", { code: code.trim(), endpoint });
     if (r.mode === "review")
@@ -274,7 +337,7 @@ server.registerTool(
     annotations: LOCAL,
   },
   async (_args, extra) => {
-    const r = await call("link_close", { endpoint: await endpointOf(SIDE, extra) });
+    const r = await call("link_close", { endpoint: await self(extra) });
     return text(r.closed.length ? `Closed ${r.closed.join(", ")}.` : "This chat has no active links.", r);
   },
 );
@@ -299,7 +362,7 @@ server.registerTool(
   },
   async (a, extra) => {
     const { request_id, ...rest } = a;
-    const r = await call("advise", { endpoint: await endpointOf(SIDE, extra), requestId: request_id, ...rest });
+    const r = await call("advise", { endpoint: await self(extra), requestId: request_id, ...rest });
     const how = { none: "Recorded; nothing sent.", "next prompt": "Will reach the primary with the user's next prompt.", now: "Sent; the other chat is being woken." };
     if (r.dup) return text("Same nits as before; not sent again.", r);
     // the user can't see tool calls, so the answer goes into the chat too
@@ -317,7 +380,7 @@ server.registerTool(
   },
   async (_args, extra) => {
     const caller = await identify(SIDE, extra);
-    const endpoint = await endpointOf(SIDE, extra);
+    const endpoint = await self(extra);
     await call("report", { side: SIDE, event: "caller", data: { tool: "bridge_status", ...caller } });
     return text(JSON.stringify({ chat: endpoint, ...(await call("status", { endpoint })), server: serverInfo, caller }, null, 2));
   },

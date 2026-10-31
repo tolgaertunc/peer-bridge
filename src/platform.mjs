@@ -123,8 +123,50 @@ function codexEntrypoint(dir) {
   return path.join(dir, "bin", "codex");
 }
 
+// Whether ChatGPT Desktop is running: true, false, or null when the check
+// itself failed (callers treat that as closed). The app is recognised by its
+// executable, not by name alone: the bundled codex CLI and app-server don't
+// count.
+export function chatgptRunning() {
+  const fake = process.env.PEER_BRIDGE_FAKE_CHATGPT_RUNNING;
+  if (fake !== undefined) return fake === "1" ? true : fake === "0" ? false : null;
+  try {
+    if (IS_WIN) {
+      // a background (window-less) app counts; the bundled CLI doesn't
+      const out = execFileSync("powershell.exe", ["-NoProfile", "-Command", "@(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -notmatch '\\\\OpenAI\\\\Codex\\\\bin\\\\' }).Count"], {
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      return Number(out.trim()) > 0;
+    }
+    if (IS_MAC) {
+      const out = execFileSync("ps", ["-axo", "command="], { encoding: "utf8", timeout: 10_000 });
+      return /\/(ChatGPT|Codex)\.app\/Contents\/MacOS\/(ChatGPT|Codex)(\s|$)/m.test(out);
+    }
+    return null; // not detected on Linux
+  } catch {
+    return null;
+  }
+}
+
+// Start ChatGPT Desktop in the background (its own delivery then wakes the
+// thread). Throws if the OS can't.
+export function openChatgpt() {
+  if (fakeOpen()) return;
+  if (IS_MAC) execFileSync("open", ["-g", "-b", "com.openai.codex"], { stdio: "ignore" });
+  else openUrl("codex://");
+}
+
+// Tests: PEER_BRIDGE_FAKE_OPEN=1 opens nothing, =fail fails
+function fakeOpen() {
+  const fake = process.env.PEER_BRIDGE_FAKE_OPEN;
+  if (fake === "fail") throw new Error("can't open (test)");
+  return fake === "1";
+}
+
 // Hand a URL (codex://…) to the OS protocol handler
 export function openUrl(url) {
+  if (fakeOpen()) return;
   // empty title arg so `start` doesn't take the URL as the window title
   if (IS_WIN) execFileSync("cmd.exe", ["/d", "/c", "start", "", url], { stdio: "ignore" });
   else if (IS_MAC) execFileSync("open", ["-g", url], { stdio: "ignore" }); // -g: don't bring the app to the front

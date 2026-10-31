@@ -26,9 +26,11 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 8);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 9);
 
 export const SIDES = ["claude", "openai"];
+// Claude Desktop's session ids, as claude://code/continue?session= accepts them
+export const HOST_ID = /^local_[A-Za-z0-9-]{1,64}$/;
 const MAX_TEXT = 40_000;
 const MAX_PROMPT = 6_000;
 const MAX_ANSWER = 10_000;
@@ -582,17 +584,44 @@ class BrokerState {
     return { id: msg.id };
   }
 
+  // Who bridge_send reaches: the chat on the other end of this chat's most
+  // recent active link, or of the link named (the one checked before sending)
+  sendTarget(endpoint, linkId) {
+    const mine = (l) => l.active && l.advisor && (sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint));
+    const link = linkId ? this.s.links[linkId] : Object.values(this.s.links).filter(mine).at(-1);
+    if (linkId && !(link && mine(link))) throw new Error(`link ${linkId} is no longer open for this chat; try again`);
+    if (!link) throw new Error("this chat has no active link; set one up with bridge_link or bridge_review first");
+    return { link, to: sameEndpoint(link.primary, endpoint) ? link.advisor : link.primary };
+  }
+
+  op_send_target({ endpoint }) {
+    const { link, to } = this.sendTarget(endpoint);
+    return { to, linkId: link.id };
+  }
+
+  // Claude Desktop's own id for a Claude Code session (claude://code/continue
+  // opens it), reported by that session's own server
+  op_host({ endpoint, hostId }) {
+    if (endpoint?.app !== "claude" || !HOST_ID.test(hostId ?? "")) throw new Error("not a Claude Desktop session id");
+    this.s.hosts = { ...(this.s.hosts ?? {}), [endpoint.id]: hostId };
+    const keys = Object.keys(this.s.hosts);
+    if (keys.length > 500) delete this.s.hosts[keys[0]];
+    return { ok: true };
+  }
+
+  // Can a Claude endpoint be reached now (its listener is up), and can it be
+  // opened (its host id is known)?
+  op_reach({ endpoint }) {
+    return { listening: !!listenerAlive(endpoint), hostId: this.s.hosts?.[endpoint?.id] ?? null };
+  }
+
   // Free-form message (bridge_send) to the chat on the other end of this
   // chat's most recent active link, so it is delivered and wakes it like any
   // other link message. Guarded against two agents chatting in a loop.
-  op_send({ endpoint, text }) {
+  op_send({ endpoint, text, linkId }) {
     if (typeof text !== "string" || !text.trim()) throw new Error("empty message");
     if (text.length > MAX_TEXT) throw new Error(`message too long (${text.length} > ${MAX_TEXT})`);
-    const link = Object.values(this.s.links)
-      .filter((l) => l.active && l.advisor && (sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)))
-      .at(-1);
-    if (!link) throw new Error("this chat has no active link; set one up with bridge_link or bridge_review first");
-    const to = sameEndpoint(link.primary, endpoint) ? link.advisor : link.primary;
+    const { link, to } = this.sendTarget(endpoint, linkId);
     const recent = this.s.messages.filter((m) => m.kind === "message" && sameEndpoint(m.fromEndpoint, endpoint) && Date.now() - m.ts < PEER_BURST.windowMs).length;
     if (recent >= PEER_BURST.count) throw new Error(`more than ${PEER_BURST.count} messages in 10 minutes; looks like a loop, wait a bit`);
     const r = this.post({ from: endpoint.app, toEndpoint: to, kind: "message", linkId: link.id, text });

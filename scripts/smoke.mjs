@@ -13,7 +13,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-smoke-"));
 const repo = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-repo-"));
-const env = { ...process.env, PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7496", PEER_BRIDGE_FAKE_CODEX: "1", PEER_BRIDGE_CONFIG_DIR: path.join(dir, "config") };
+// ChatGPT counts as running and nothing is really opened, unless a step says otherwise
+const env = { ...process.env, PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7496", PEER_BRIDGE_FAKE_CODEX: "1", PEER_BRIDGE_CONFIG_DIR: path.join(dir, "config"), PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "1", PEER_BRIDGE_FAKE_OPEN: "1" };
+delete env.CLAUDE_CODE_HOST_SESSION_ID; // a server run from inside Claude Desktop would inherit its own
 fs.mkdirSync(env.PEER_BRIDGE_CONFIG_DIR);
 fs.writeFileSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "rules.md"), "Never commit without asking me.\n");
 const server = path.resolve(import.meta.dirname, "../src/server.mjs");
@@ -211,6 +213,62 @@ assert.match(gptReq, /not attached: this chat's project folder is unknown/);
 assert.doesNotMatch(gptReq, /parser\.js/);
 await call(claude, "bridge_advise", { request_id: gptReq.match(/id=(m\d+) kind=review-request/)[1], decision: "approved" });
 console.log("5c ChatGPT-side review without a known project folder attaches no diff");
+
+// 5d. the other side closed: nothing is sent and the agent is told to ask the
+// user; open=true opens it first, then sends; remember=true makes that the
+// default; a failed open sends nothing; a round isn't used up by asking
+{
+  const events = () => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const opened = () => events().filter((e) => e.op === "report" && e.event === "opened");
+  const closedGpt = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-open", CLAUDE_CODE_HOST_SESSION_ID: "local_open-1", CLAUDE_PROJECT_DIR: repo, PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "0" });
+  const links = async () => JSON.parse(textOf(await call(closedGpt, "bridge_status"))).links.length;
+  const before = await links();
+  const asked = textOf(await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check A." }));
+  assert.match(asked, /^Nothing was sent: ChatGPT Desktop isn't open\. Ask the user whether to open it\./);
+  assert.equal(await links(), before, "nothing made while asking");
+  await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check B.", open: true });
+  assert.ok(opened().some((e) => e.data.target.app === "openai"));
+  await deliveredTo("gpt-closed", /Check B\./);
+  assert.ok(!fs.existsSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json")), "open alone doesn't change the setting");
+
+  // a round asked for while ChatGPT is closed isn't used up
+  const rq = (await call(closedGpt, "bridge_review", { reviewer: "join", include_diff: false, request: "Round test." })).structuredContent;
+  await call(openai, "bridge_link_join", { code: rq.joinCode }, asGpt("gpt-rounds-closed"));
+  const r1 = await deliveredTo("gpt-rounds-closed", /Round test\./);
+  await call(openai, "bridge_advise", { request_id: r1.match(/Review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "x" }] }, asGpt("gpt-rounds-closed"));
+  assert.match(textOf(await call(closedGpt, "bridge_review", { round_of: rq.id, request: "Fixed." })), /^Nothing was sent/);
+  assert.equal((await call(closedGpt, "bridge_review", { round_of: rq.id, request: "Fixed.", open: true })).structuredContent.round, 2, "the round wasn't used up by asking");
+
+  await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check C.", open: true, remember: true });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json"), "utf8")).openClosedApps, "always");
+  const n = opened().length;
+  await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check D." });
+  assert.equal(opened().length, n + 1, "always: opened without asking");
+  fs.rmSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json"));
+  await closedGpt.close();
+
+  const failing = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-open-fail", CLAUDE_PROJECT_DIR: repo, PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "0", PEER_BRIDGE_FAKE_OPEN: "fail" });
+  assert.match(textOf(await call(failing, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check E.", open: true })), /^Nothing was sent: opening ChatGPT Desktop failed/);
+  await failing.close();
+  assert.ok(!events().some((e) => e.op === "fake-codex-deliver" && /Check (A|E)\./.test(e.text)), "nothing sent while closed or when opening failed");
+
+  // a closed Claude session: opened through Claude Desktop with the id its own
+  // server reported; without one, the user is asked to open it by hand
+  const claudeOpen = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-to-open", CLAUDE_CODE_HOST_SESSION_ID: "local_to-open-1", CLAUDE_PROJECT_DIR: repo });
+  const cl = (await call(claudeOpen, "bridge_link", { advisor: "join" })).structuredContent;
+  await call(openai, "bridge_link_join", { code: cl.joinCode }, asGpt("gpt-sends-to-claude"));
+  assert.match(textOf((await openai.callTool({ name: "bridge_send", arguments: { text: "hi" }, _meta: asGpt("gpt-sends-to-claude") }))), /^Nothing was sent: the Claude Code session claude-to-open isn't open/);
+  await call(openai, "bridge_send", { text: "hi, opened", open: true }, asGpt("gpt-sends-to-claude"));
+  assert.ok(opened().some((e) => e.data.target.id === "claude-to-open"));
+  assert.ok(events().some((e) => e.op === "send" && e.to?.id === "claude-to-open"));
+  await claudeOpen.close();
+  const noHost = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-no-host", CLAUDE_PROJECT_DIR: repo });
+  const nh = (await call(noHost, "bridge_link", { advisor: "join" })).structuredContent;
+  await call(openai, "bridge_link_join", { code: nh.joinCode }, asGpt("gpt-sends-to-nohost"));
+  assert.match(textOf(await openai.callTool({ name: "bridge_send", arguments: { text: "hi", open: true }, _meta: asGpt("gpt-sends-to-nohost") })), /doesn't know how to open the Claude Code session claude-no-host/);
+  await noHost.close();
+  console.log("5d closed side: nothing sent, agent told to ask; open=true opens then sends; remember sets always; failed open sends nothing; rounds not used up; Claude opened by its own host id, else by hand");
+}
 
 // 6. status from the ChatGPT side knows its own chat; unlink ends reviews
 const gptStatus = JSON.parse(textOf(await call(openai, "bridge_status", {}, asGpt(THREAD))));
