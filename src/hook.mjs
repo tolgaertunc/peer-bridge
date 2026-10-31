@@ -102,7 +102,9 @@ if (event === "prompt") {
     ]
       .filter(Boolean)
       .join("\n\n");
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context } }));
+    // flushed before exit: a piped stdout over 8 KB would be cut off
+    const out = JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context } });
+    await new Promise((resolve) => process.stdout.write(out, resolve));
     hookLog({ notes: notes.map((n) => n.id) });
   }
   process.exit(0);
