@@ -20,7 +20,7 @@ const stale = spawn(process.execPath, ["--input-type=module", "-e", `const b=awa
   env: { ...process.env, PEER_BRIDGE_TEST_PROTOCOL: "1" },
 });
 await new Promise((r) => stale.stdout.once("data", r));
-const { call } = await import("../src/broker.mjs");
+const { call, inlineText, nextStep } = await import("../src/broker.mjs");
 await call("link_create", { primary: { app: "claude", id: "probe" } }); // op the stale owner wouldn't run new code for
 await call("link_close", { endpoint: { app: "claude", id: "probe" } });
 stale.kill();
@@ -88,26 +88,28 @@ await until(() => state().messages.find((m) => m.id === req.id)?.readAt);
 assert.equal((await call("receive", { side: "openai", endpoint: GPT })).messages.length, 0);
 const listener = runHook("claude", "listen", { session_id: CLAUDE.id });
 await sleep(1500);
-const adv = await call("advise", { endpoint: GPT, verdict: "incorrect", severity: "concern", note: "Parser drops the last token." });
+const adv = await call("advise", { endpoint: GPT, requestId: req.id, decision: "changes_requested", blocking: [{ title: "Parser drops the last token." }] });
 assert.equal(adv.delivered, "now");
 r = await listener;
 assert.equal(r.code, 2, "listener must exit 2 to wake Claude");
 assert.match(r.err, /flagged your last turn/);
 console.log(`3 concern → Claude listener exited 2: ${r.err.split("\n")[0].slice(0, 90)}…`);
 
-// 4. the follow-up turn the advisory triggered is not sent back for review
+// 4. the fix loop: the turn after an advisory is reviewed again
 const before = state().messages.length;
 await call("receive", { side: "claude", endpoint: CLAUDE });
 await runHook("claude", "stop", { session_id: CLAUDE.id, last_assistant_message: "Fixed the last token." });
-await until(() => events().some((e) => e.op === "turn_end" && e.skipped === "advisory follow-up"));
-assert.equal(state().messages.length, before);
-console.log("4 advisory follow-up turn not re-reviewed (no cascade)");
+const again = await until(() => state().messages.length === before + 1 && state().messages.at(-1));
+assert.equal(again.kind, "review-request");
+assert.match(again.text, /Fixed the last token/);
+console.log("4 the turn after an advisory is reviewed again (fix loop)");
 
-// 5. nits wait for the next prompt, once; duplicates are dropped
+// 5. approval with nits: they wait for the next prompt, once; the same nits
+// again are dropped
+await call("advise", { endpoint: GPT, requestId: again.id, decision: "approved", nits: [{ title: "Name the test after the bug." }] });
 await runHook("claude", "stop", { session_id: CLAUDE.id, last_assistant_message: "Added tests." });
-await until(() => state().messages.length === before + 1);
-await call("advise", { endpoint: GPT, verdict: "correct", severity: "nit", note: "Name the test after the bug." });
-const dup = await call("advise", { endpoint: GPT, verdict: "correct", severity: "nit", note: "Name the test after the bug." });
+const third = await until(() => state().messages.length === before + 2 && state().messages.at(-1));
+const dup = await call("advise", { endpoint: GPT, requestId: third.id, decision: "approved", nits: [{ title: "Name the test after the bug." }] });
 assert.ok(dup.dup);
 r = await runHook("claude", "prompt", { session_id: CLAUDE.id, prompt: "next" });
 const ctx = JSON.parse(r.out).hookSpecificOutput;
@@ -133,22 +135,23 @@ assert.equal(r.code, 2);
 assert.match(r.err, /Review request/);
 const gptReq = await until(() => state().messages.find((m) => m.kind === "review-request" && m.linkId === l2.id));
 assert.match(gptReq.text, /User's message:\nWrite a reversible migration\./);
-await call("advise", { endpoint: CLAUDE2, verdict: "incorrect", severity: "blocker", note: "Migration is not reversible." });
+await call("advise", { endpoint: CLAUDE2, requestId: gptReq.id, decision: "changes_requested", blocking: [{ title: "Migration is not reversible." }] });
 await until(() => events().some((e) => e.op === "fake-codex-deliver" && /flagged your last turn/.test(e.text)));
-console.log("6 GPT primary → Claude advisor (join code): listener woke Claude (question + answer), blocker queued back to the GPT thread");
+console.log("6 GPT primary → Claude advisor (join code): listener woke Claude (question + answer), changes requested queued back to the GPT thread");
 
 // 6b. a question is only attached to its own turn: other turn id → not
 // captured, and it is not reused for the turn after
 await call("receive", { side: "claude", endpoint: CLAUDE2 });
-await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t10", last_assistant_message: "Applied the fix." }); // advisory follow-up, skipped
+await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t10", last_assistant_message: "Applied the fix." }); // reviewed again (fix loop)
 await runHook("openai", "prompt", { session_id: GPT.id, turn_id: "t11", prompt: "Old question." });
 await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t12", last_assistant_message: "Answer to t12." });
-const t12 = await until(() => state().messages.find((m) => m.kind === "review-request" && /Answer to t12/.test(m.text)));
+const t12 = await until(() => state().messages.find((m) => m.kind === "review-request" && /Primary's final message:\nAnswer to t12/.test(m.text)));
 assert.match(t12.text, /User's message:\n\(not captured\)/);
-assert.doesNotMatch(t12.text, /Old question/);
+const question = (m) => m.text.split("Primary's final message")[0]; // not the diff, which may quote this file
+assert.doesNotMatch(question(t12), /Old question/);
 await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t13", last_assistant_message: "Answer to t13." });
-const t13 = await until(() => state().messages.find((m) => m.kind === "review-request" && /Answer to t13/.test(m.text)));
-assert.doesNotMatch(t13.text, /Old question/);
+const t13 = await until(() => state().messages.find((m) => m.kind === "review-request" && /Primary's final message:\nAnswer to t13/.test(m.text)));
+assert.doesNotMatch(question(t13), /Old question/);
 console.log("6b question attached only to its own turn, never reused");
 
 // 7. one listener per session: a newer one supersedes the older
@@ -177,12 +180,12 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   await sleep(1200);
   const got = await call("receive", { side: "claude", endpoint: REV });
   assert.match(got.messages[0].text, /Check the parser/);
-  await call("advise", { endpoint: REV, verdict: "correct", severity: "none", note: "" });
+  await call("advise", { endpoint: REV, requestId: got.messages[0].id, decision: "approved" });
   r = await requester;
   assert.equal(r.code, 2);
   assert.match(r.err, /review you asked for is ready/);
   assert.equal(state().links[rl.id].active, false);
-  console.log("10 one-off review: answer woke the requester, link closed (even with severity none)");
+  console.log("10 one-off review: answer woke the requester, link closed (also when simply approved)");
 }
 
 // 11. Claude advisor not listening → the primary is told with its next prompt
@@ -223,16 +226,17 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   const lb = await call("link_create", { primary: B, mode: "review", advisor: RV, request: "Review B." });
   const msgs = (await call("receive", { side: "claude", endpoint: RV })).messages;
   const reqA = msgs.find((m) => /Review A/.test(m.text)).id;
-  await assert.rejects(call("advise", { endpoint: RV, verdict: "correct", severity: "none", note: "" }), /several review requests are open/);
-  await call("advise", { endpoint: RV, requestId: reqA, verdict: "correct", severity: "nit", note: "A is fine." });
+  const reqB = msgs.find((m) => /Review B/.test(m.text)).id;
+  await assert.rejects(call("advise", { endpoint: RV, decision: "approved" }), /request_id is required/);
+  await call("advise", { endpoint: RV, requestId: reqA, decision: "approved", nits: [{ title: "A is fine." }] });
   const st = state();
   assert.equal(st.links[la.id].active, false, "A's review closed");
   assert.equal(st.links[lb.id].active, true, "B's review still open");
   assert.ok(st.messages.some((m) => m.kind === "review-result" && sameTo(m.toEndpoint, A) && /A is fine/.test(m.text)));
   assert.ok(!st.messages.some((m) => m.kind === "review-result" && sameTo(m.toEndpoint, B)));
-  await call("advise", { endpoint: RV, verdict: "correct", severity: "none", note: "" }); // only B open now
+  await call("advise", { endpoint: RV, requestId: reqB, decision: "approved" });
   assert.equal(state().links[lb.id].active, false);
-  console.log("16 concurrent reviews: answer routed by request id, ambiguity refused");
+  console.log("16 concurrent reviews: answer routed by request id, which is required");
 }
 
 // 17. pruning never drops unread messages by count
@@ -321,7 +325,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
     const out = await new Promise((resolve) => {
       const p = spawn(process.execPath, ["--input-type=module", "-e",
         `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");` +
-        `try{console.log(JSON.stringify(await b.call("advise",{endpoint:${JSON.stringify(G)},requestId:"m1",verdict:"incorrect",severity:"concern",note:"still answerable"})))}catch(e){console.log(JSON.stringify({error:e.message}))}process.exit(0);`], { env: env4 });
+        `try{console.log(JSON.stringify(await b.call("advise",{endpoint:${JSON.stringify(G)},requestId:"m1",decision:"changes_requested",blocking:[{title:"still answerable"}]})))}catch(e){console.log(JSON.stringify({error:e.message}))}process.exit(0);`], { env: env4 });
       let o = "";
       p.stdout.on("data", (d) => (o += d));
       p.on("close", () => resolve(o));
@@ -334,6 +338,170 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
     console.log("18 a day-old review request already handed to ChatGPT is still answerable; read messages still capped");
   } finally {
     fs.rmSync(dir4, { recursive: true, force: true });
+  }
+}
+
+// 19. answers: one format, contradictions refused
+{
+  const RQ = { app: "claude", id: "claude-format" };
+  const RV = { app: "claude", id: "claude-format-reviewer" };
+  const l = await call("link_create", { primary: RQ, mode: "review", advisor: RV, request: "Check." });
+  const id = state().messages.find((m) => m.linkId === l.id).id;
+  await assert.rejects(call("advise", { endpoint: RV, requestId: id, decision: "approved", blocking: [{ title: "x" }] }), /an approval can't have must-fix items/);
+  await assert.rejects(call("advise", { endpoint: RV, requestId: id, decision: "changes_requested", nits: [{ title: "x" }] }), /needs at least one must-fix item/);
+  const a = await call("advise", { endpoint: RV, requestId: id, decision: "changes_requested", note: "Close.", blocking: [{ title: "Off by one", file: "a.js", line: 3, detail: "loop ends early" }], nits: [{ title: "Rename i" }] });
+  assert.equal(a.text, "[CHANGES REQUESTED]\n\nClose.\n\nMust fix:\n- Off by one (a.js:3): loop ends early\n\nNits (optional, don't block approval):\n- Rename i");
+  console.log("19 answers start with [APPROVED]/[CHANGES REQUESTED], nits apart; contradictions refused");
+}
+
+// 20. review rounds: the next round goes to the same reviewer with the same
+// kind; one continuation per round; none after approval, for someone else's
+// review, or past the cap
+{
+  process.env.PEER_BRIDGE_MAX_ROUNDS = "3";
+  const RQ = { app: "claude", id: "claude-rounds" };
+  const RV = { app: "openai", id: "gpt-rounds" };
+  const answer = async (linkId, decision) => {
+    const id = state().messages.find((m) => m.kind === "review-request" && m.linkId === linkId).id;
+    return call("advise", { endpoint: RV, requestId: id, decision, ...(decision === "changes_requested" && { blocking: [{ title: "fix it" }] }) });
+  };
+  const l1 = await call("link_create", { primary: RQ, mode: "review", advisor: RV, request: "Plan: do it", plan: true });
+  await assert.rejects(call("link_continue", { primary: RQ, roundOf: l1.id, request: "early" }), /still waiting for its answer/);
+  await answer(l1.id, "changes_requested");
+  const res1 = state().messages.find((m) => m.kind === "review-result" && m.linkId === l1.id);
+  assert.match(inlineText(res1), new RegExp(`bridge_review\\(round_of="${l1.id}"\\)`));
+  await assert.rejects(call("link_continue", { primary: { app: "claude", id: "someone-else" }, roundOf: l1.id, request: "x" }), /not a review this chat asked for/);
+  await assert.rejects(call("link_continue", { primary: RQ, roundOf: l1.id, request: "x", plan: false }), /was a plan review/);
+  await assert.rejects(call("link_continue", { primary: RQ, roundOf: l1.id, request: "x", threadId: "gpt-other" }), /reviewed in another chat/);
+  const l2 = await call("link_continue", { primary: RQ, roundOf: l1.id, request: "Changed X; I disagree on Y because Z." });
+  assert.equal(l2.round, 2);
+  await assert.rejects(call("link_continue", { primary: RQ, roundOf: l1.id, request: "again" }), /already continued by/);
+  const req2 = state().messages.find((m) => m.kind === "review-request" && m.linkId === l2.id);
+  assert.deepEqual(req2.toEndpoint, RV);
+  assert.ok(req2.plan, "a plan review stays a plan review");
+  assert.match(req2.text, new RegExp(`^Round 2 of review ${l1.id}`));
+  await answer(l2.id, "changes_requested");
+  const l3 = await call("link_continue", { primary: RQ, roundOf: l2.id, request: "Round 3." });
+  await answer(l3.id, "changes_requested");
+  const res3 = state().messages.find((m) => m.kind === "review-result" && m.linkId === l3.id);
+  assert.match(nextStep(res3), /last round allowed: stop and ask the user/);
+  assert.match(nextStep(res3), /wait for the user's explicit approval/, "the plan gate stays");
+  await assert.rejects(call("link_continue", { primary: RQ, roundOf: l3.id, request: "Round 4." }), /3 rounds without approval: stop and ask the user/);
+  const k1 = await call("link_create", { primary: RQ, mode: "review", advisor: RV, request: "Code." });
+  await answer(k1.id, "approved");
+  await assert.rejects(call("link_continue", { primary: RQ, roundOf: k1.id, request: "more" }), /was approved; there is nothing to re-review/);
+  delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+  console.log("20 review rounds: same reviewer and kind, round header, one continuation per round, refused after approval, for others, past the cap");
+}
+
+// 21. advisor fix loop: a prompt the bridge delivered doesn't reset the count,
+// a real user prompt does; at the cap the primary is told once to stop and
+// ask the user, and isn't reviewed until the user writes; answers to requests
+// from before the user's latest prompt don't steer
+{
+  process.env.PEER_BRIDGE_MAX_ROUNDS = "2";
+  const P = { app: "openai", id: "gpt-loop" };
+  const A = { app: "claude", id: "claude-loop-advisor" };
+  const l = await call("link_create", { primary: P, advisor: A });
+  const openReq = () => until(() => state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id && !m.answeredAt));
+  const reject = async () => call("advise", { endpoint: A, requestId: (await openReq()).id, decision: "changes_requested", blocking: [{ title: "still wrong" }] });
+  const stopTurn = (t) => runHook("openai", "stop", { session_id: P.id, turn_id: t, last_assistant_message: `turn ${t}` });
+  const prompt = (t, text) => runHook("openai", "prompt", { session_id: P.id, turn_id: t, prompt: text });
+  await prompt("u1", "Build it.");
+  await stopTurn("u1");
+  const adv1 = await reject();
+  assert.equal(adv1.delivered, "now");
+  // the advisory comes back as a queued prompt: the bridge's, not the user's
+  const advisory = state().messages.find((m) => m.id === adv1.id);
+  await prompt("b1", inlineText(advisory));
+  await stopTurn("b1");
+  const adv2 = await reject();
+  assert.ok(adv2.stopped, "second rejection in a row hits the cap of 2");
+  const stopMsg = state().messages.find((m) => m.id === adv2.id);
+  assert.equal(stopMsg.kind, "stop");
+  assert.match(inlineText(stopMsg), /Stop the fix loop now: tell the user where it stands and ask how to proceed/);
+  assert.ok(state().links[l.id].stopped, "kept in state.json, so a broker restart keeps it");
+  await prompt("b2", inlineText(stopMsg));
+  await stopTurn("b2");
+  await until(() => events().some((e) => e.op === "turn_end" && e.link === l.id && e.skipped === "stopped"));
+  // a user typing a look-alike header is still the user
+  await prompt("u2", "CODEX: Message m99999 (link L99999) please go on");
+  await until(() => !state().links[l.id].stopped && state().links[l.id].rounds === 0); // a real user prompt lifts the stop
+  await stopTurn("u2");
+  const pending = await openReq();
+  await prompt("u3", "Actually, do something else.");
+  await until(() => state().links[l.id].generation > pending.generation);
+  const late = await call("advise", { endpoint: A, requestId: pending.id, decision: "changes_requested", blocking: [{ title: "old" }] });
+  assert.ok(late.stale && late.delivered === "none", "an answer from before the user's latest prompt doesn't steer");
+  delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+  console.log("21 advisor loop: bridge prompts don't reset, user prompts do; stop at the cap, no reviews until the user writes; stale answers ignored");
+}
+
+// 22. telling the bridge's prompts from the user's: exact text, once per
+// delivery, so the same text again is the user's; a delivery still being sent
+// already counts, and "sending" is on disk before the thread can run it
+{
+  const P = { app: "openai", id: "gpt-detect" };
+  const A = { app: "claude", id: "claude-detect-advisor" };
+  const l = await call("link_create", { primary: P, advisor: A });
+  const gen = () => state().links[l.id].generation;
+  await call("turn_start", { endpoint: P, prompt: "Start." });
+  assert.equal(gen(), 1);
+  await call("turn_end", { endpoint: P, lastMessage: "done" });
+  const req = state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id);
+  process.env.PEER_BRIDGE_FAKE_CODEX = "slow";
+  const adv = await call("advise", { endpoint: A, requestId: req.id, decision: "changes_requested", blocking: [{ title: "no" }] });
+  const msg = () => state().messages.find((m) => m.id === adv.id);
+  assert.equal(msg().dispatch.state, "sending", "sending is saved before the delivery is handed over");
+  const delivered = inlineText(msg());
+  assert.ok((await call("turn_start", { endpoint: P, turnId: "b1", prompt: delivered })).fromBridge, "a delivery still being sent already counts as the bridge's");
+  assert.equal(gen(), 1);
+  assert.ok(!(await call("turn_start", { endpoint: P, turnId: "u2", prompt: delivered })).fromBridge, "the same text in a later turn is the user's");
+  assert.equal(gen(), 2);
+  assert.ok(!(await call("turn_start", { endpoint: P, turnId: "u3", prompt: delivered.split("\n")[0] })).fromBridge, "a header alone is the user's");
+  await until(() => msg().dispatch.state === "sent");
+  process.env.PEER_BRIDGE_FAKE_CODEX = "1";
+  for (const bad of ["oops", "Infinity", "0", "-3", "2.5"]) {
+    process.env.PEER_BRIDGE_MAX_ROUNDS = bad;
+    const RQ = { app: "claude", id: `claude-cap-${bad}` };
+    const prev = await call("link_create", { primary: RQ, mode: "review", advisor: A, request: "x" });
+    const id = state().messages.find((m) => m.linkId === prev.id).id;
+    await call("advise", { endpoint: A, requestId: id, decision: "changes_requested", blocking: [{ title: "x" }] });
+    assert.equal((await call("link_continue", { primary: RQ, roundOf: prev.id, request: "y" })).round, 2, `cap "${bad}" falls back to 20`);
+  }
+  delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+  console.log("22 bridge prompts: exact text, once per delivery, counted while still sending; a bad cap falls back to 20");
+}
+
+// 23. an owner that takes over doesn't resend a delivery whose turn already
+// ran: it was stuck in "sending", but its prompt was matched
+{
+  const dir5 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-resend-"));
+  try {
+    const P = { app: "openai", id: "gpt-resend" };
+    const old = Date.now() - 5 * 60_000;
+    const m = (id, extra) => ({ id, from: "claude", to: "openai", toEndpoint: P, kind: "advisory", linkId: "L1", text: "x", ts: old, readAt: null, ...extra });
+    fs.writeFileSync(
+      path.join(dir5, "state.json"),
+      JSON.stringify({
+        seq: 3, linkSeq: 1, notes: [],
+        links: { L1: { id: "L1", mode: "advisor", active: true, createdAt: old, primary: P, advisor: { app: "claude", id: "c" }, reviews: 1, advisories: [] } },
+        messages: [m("m1", { dispatch: { state: "sending", at: old }, promptMatched: old }), m("m2", { dispatch: { state: "sending", at: old } })],
+      }),
+    );
+    const env5 = { ...process.env, PEER_BRIDGE_DIR: dir5, PEER_BRIDGE_PORT: "7493", PEER_BRIDGE_FAKE_CODEX: "1" };
+    await new Promise((resolve) => {
+      const p = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");setTimeout(()=>process.exit(0),300);`], { env: env5 });
+      p.on("close", resolve);
+    });
+    const st5 = JSON.parse(fs.readFileSync(path.join(dir5, "state.json"), "utf8"));
+    const ev5 = fs.readFileSync(path.join(dir5, "events.jsonl"), "utf8");
+    assert.equal(st5.messages.find((x) => x.id === "m1").dispatch.state, "sent");
+    assert.ok(!/"op":"fake-codex-deliver"[^\n]*"text":"CLAUDE: Your advisor flagged your last turn: m1 /.test(ev5), "a matched delivery isn't sent again");
+    assert.match(ev5, /"op":"fake-codex-deliver"[^\n]*m2 \(link L1\)/, "an unmatched stuck one is retried");
+    console.log("23 a stuck delivery whose turn already ran isn't resent; an unmatched one is retried");
+  } finally {
+    fs.rmSync(dir5, { recursive: true, force: true });
   }
 }
 

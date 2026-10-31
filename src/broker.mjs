@@ -26,14 +26,20 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 7);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 8);
 
 export const SIDES = ["claude", "openai"];
 const MAX_TEXT = 40_000;
 const MAX_PROMPT = 6_000;
 const MAX_ANSWER = 10_000;
 export const MAX_DIFF = 20_000;
-const SEVERITIES = ["none", "nit", "concern", "blocker"];
+const DECISIONS = ["approved", "changes_requested"];
+// Emergency stop for two agents stuck in a fix loop: rounds in a row without
+// approval. The primary decides when it's stuck well before this.
+const MAX_ROUNDS = () => {
+  const n = Number(process.env.PEER_BRIDGE_MAX_ROUNDS);
+  return Number.isInteger(n) && n > 0 ? n : 20; // a typo mustn't turn the stop off
+};
 const DAY = 24 * 3600_000;
 // free-form peer messages (bridge_send) can ping-pong; links can't
 const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
@@ -102,12 +108,13 @@ function listenerAlive(endpoint) {
 // What the woken chat sees; self-contained so it works after compaction
 export function wakeText(m) {
   if (m.kind === "review-request")
-    return `[PEER-BRIDGE] ${m.plan ? "Plan review" : "Review"} request ${m.id} (link ${m.linkId}) from ${m.from} is waiting. Call bridge_receive to read it, review it, then call bridge_advise with your verdict.`;
-  if (m.kind === "advisory")
-    return `[PEER-BRIDGE] Your advisor (${m.from}) flagged your last turn: ${m.id} (link ${m.linkId}). Call bridge_receive to read it, then address it or explain why not.`;
-  if (m.kind === "review-result")
-    return `[PEER-BRIDGE] The ${m.plan ? "plan review" : "review"} you asked for is ready: ${m.id} (link ${m.linkId}) from ${m.from}. Call bridge_receive to read it.${m.plan ? ` ${nextStep(m)}` : ""}`;
-  return `[PEER-BRIDGE] New message ${m.id} from ${m.from} is waiting. Call bridge_receive to read it. ${nextStep(m)}`;
+    return `[PEER-BRIDGE] ${m.plan ? "Plan review" : "Review"} request ${m.id} (link ${m.linkId}) from ${m.from} is waiting. Call bridge_receive to read it, review it, then call bridge_advise with your decision.`;
+  const what = {
+    advisory: `Your advisor (${m.from}) flagged your last turn: ${m.id} (link ${m.linkId})`,
+    "review-result": `The ${m.plan ? "plan review" : "review"} you asked for is ready: ${m.id} (link ${m.linkId}) from ${m.from}`,
+    stop: `Your advisor (${m.from}) and you are stuck: ${m.id} (link ${m.linkId})`,
+  }[m.kind] ?? `New message ${m.id} from ${m.from} is waiting`;
+  return `[PEER-BRIDGE] ${what}. Call bridge_receive to read it. ${nextStep(m)}`;
 }
 
 // The bridge's own rule after a plan review, never the reviewer's words: the
@@ -115,14 +122,40 @@ export function wakeText(m) {
 export const PLAN_GATE =
   "This was a plan review: show the user the plan as it now stands and the reviewer's verdict, then wait for the user's explicit approval in this chat before implementing anything.";
 
-// What to do with a message, by kind. A plain message is not a review
-// request, so it is answered with bridge_send, never bridge_advise.
-function nextStep(m) {
+// What to do with a message, by kind and decision. These are the bridge's
+// fixed instructions, never the other agent's words. A plain message is not a
+// review request, so it is answered with bridge_send, never bridge_advise.
+export function nextStep(m) {
   if (m.kind === "review-request") return `Review ${m.plan ? "the plan" : "it"}, then answer once with bridge_advise (request_id ${m.id}).`;
-  if (m.kind === "advisory") return "Address it, or tell the user why not.";
-  if (m.kind === "review-result" && m.plan) return PLAN_GATE;
-  if (m.kind === "review-result") return "Weigh it, act on what holds up, and tell the user what you changed or why you didn't.";
+  if (m.kind === "advisory")
+    return "Fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed again. If you're going in circles or the rest needs a decision, stop and ask the user.";
+  if (m.kind === "stop") return "Stop the fix loop now: tell the user where it stands and ask how to proceed. Don't keep fixing until they answer.";
+  if (m.kind === "review-result") {
+    const step =
+      m.decision === "approved"
+        ? "Approved; the nits are optional."
+        : m.lastRound
+          ? "Changes requested, and that was the last round allowed: stop and ask the user how to proceed."
+          : m.decision === "changes_requested"
+            ? `Fix what holds up; if a finding is wrong, say why instead of complying. Then ask for the next round with bridge_review(round_of="${m.linkId}"), saying what you changed and where you disagree. If you're going in circles or the rest needs a decision, stop and ask the user.`
+            : "Weigh it, act on what holds up, and tell the user what you changed or why you didn't.";
+    return m.plan ? `${step} ${PLAN_GATE}` : step;
+  }
   return "It is a message, not a review request: if it needs a reply, send one with bridge_send (not bridge_advise).";
+}
+
+// The one way an answer reads, in every chat: the decision first, then what
+// must change, then the nits, which never block approval
+export function renderAnswer({ decision, note, blocking = [], nits = [] }) {
+  const item = (f) => `- ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}${f.detail ? `: ${f.detail}` : ""}`;
+  return [
+    decision === "approved" ? "[APPROVED]" : "[CHANGES REQUESTED]",
+    note?.trim(),
+    blocking.length && "Must fix:\n" + blocking.map(item).join("\n"),
+    nits.length && "Nits (optional, don't block approval):\n" + nits.map(item).join("\n"),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 const LABEL = { claude: "CLAUDE", openai: "CODEX" };
@@ -135,6 +168,7 @@ export function inlineText(m) {
     "review-request": `${m.plan ? "Plan review" : "Review"} request ${m.id}`,
     advisory: `Your advisor flagged your last turn: ${m.id}`,
     "review-result": `The ${m.plan ? "plan review" : "review"} you asked for: ${m.id}`,
+    stop: `Stop the fix loop: ${m.id}`,
   }[m.kind] ?? `Message ${m.id}`;
   return [
     `${LABEL[m.from] ?? m.from.toUpperCase()}: ${title} (link ${m.linkId})`,
@@ -146,6 +180,7 @@ export function inlineText(m) {
 async function deliverToCodex(threadId, text) {
   if (process.env.PEER_BRIDGE_FAKE_CODEX) {
     if (process.env.PEER_BRIDGE_FAKE_CODEX === "fail") throw new Error("ChatGPT Desktop not reachable (test)");
+    if (process.env.PEER_BRIDGE_FAKE_CODEX === "slow") await new Promise((r) => setTimeout(r, 1500));
     logEvent({ op: "fake-codex-deliver", threadId, text });
     return;
   }
@@ -236,11 +271,25 @@ class BrokerState {
   // Codex endpoints are woken through the app's thread queue; Claude endpoints
   // by their listener hook, which watches state.json itself
   dispatch() {
+    const due = [];
     for (const m of this.s.messages) {
-      // a "sending" left behind by an owner that died mid-send is retried
+      // a "sending" left behind by an owner that died mid-send is retried,
+      // unless its turn already ran (the thread had it after all)
       const stuck = m.dispatch?.state === "sending" && Date.now() - m.dispatch.at > 60_000;
       if (m.toEndpoint?.app !== "openai" || (m.dispatch && !stuck)) continue;
+      if (stuck && m.promptMatched) {
+        m.dispatch = { state: "sent", at: Date.now() };
+        m.readAt ??= Date.now();
+        continue;
+      }
       m.dispatch = { state: "sending", at: Date.now() };
+      due.push(m);
+    }
+    if (!due.length) return;
+    // on disk before the thread can run it, so an owner that takes over still
+    // knows the prompt is the bridge's
+    this.save();
+    for (const m of due)
       deliverToCodex(m.toEndpoint.id, inlineText(m)).then(
         () => {
           m.dispatch = { state: "sent", at: Date.now() };
@@ -258,7 +307,6 @@ class BrokerState {
           this.save();
         },
       );
-    }
   }
 
   // Delivery outcome per link; failures reach the chat that is waiting on it
@@ -333,7 +381,10 @@ class BrokerState {
     const link = { id, mode, name: name ?? null, active: true, createdAt: Date.now(), primary, advisor: advisor ?? null, reviews: 0, advisories: [] };
     if (!advisor) link.joinCode = crypto.randomBytes(3).toString("hex");
     if (request) link.request = request.slice(0, MAX_TEXT - 500);
-    if (mode === "review" && plan) link.plan = true; // a plan to review, not code
+    if (mode === "review") {
+      link.round = 1;
+      if (plan) link.plan = true; // a plan to review, not code
+    } else link.generation = 0; // bumped by each real user prompt
     this.s.links[id] = link;
     logEvent({ op: "link_create", id, mode, primary, advisor: advisor ?? null });
     if (advisor) this.sendReviewRequest(link);
@@ -358,6 +409,45 @@ class BrokerState {
     delete link.request;
   }
 
+  // The previous round of a review, as its requester may continue it
+  roundToContinue(primary, linkId) {
+    const prev = this.s.links[linkId];
+    if (!prev || prev.mode !== "review" || !sameEndpoint(prev.primary, primary)) throw new Error(`${linkId} is not a review this chat asked for`);
+    if (prev.active) throw new Error(`${linkId} is still waiting for its answer`);
+    if (prev.decision === "approved") throw new Error(`${linkId} was approved; there is nothing to re-review`);
+    if (prev.decision !== "changes_requested") throw new Error(`${linkId} didn't end with changes requested, so it can't be continued`);
+    if (prev.continuedBy) throw new Error(`${linkId} was already continued by ${prev.continuedBy}`);
+    if (!prev.advisor) throw new Error(`${linkId} has no reviewer`);
+    return prev;
+  }
+
+  // What the requester needs to build the next round's request
+  op_round_info({ primary, roundOf }) {
+    const prev = this.roundToContinue(primary, roundOf);
+    return { plan: !!prev.plan, round: (prev.round ?? 1) + 1, advisor: prev.advisor };
+  }
+
+  // The next round of a review: same reviewer, same kind, round + 1. One
+  // continuation per round (checked and set in this one op), and none past
+  // the emergency cap.
+  op_link_continue({ primary, roundOf, request, plan, threadId }) {
+    const prev = this.roundToContinue(primary, roundOf);
+    if (plan !== undefined && !!plan !== !!prev.plan) throw new Error(`${roundOf} was a ${prev.plan ? "plan" : "code"} review; continue it as one`);
+    if (threadId && !(prev.advisor.app === "openai" && prev.advisor.id === threadId)) throw new Error(`${roundOf} was reviewed in another chat; continue it there`);
+    const round = (prev.round ?? 1) + 1;
+    if (round > MAX_ROUNDS()) throw new Error(`${round - 1} rounds without approval: stop and ask the user how to proceed`);
+    const id = "L" + ++this.s.linkSeq;
+    prev.continuedBy = id;
+    const heading = `Round ${round} of review ${roundOf} (earlier rounds ended with [CHANGES REQUESTED]). Answer each point the requester disagrees with: accept it or hold, and say why.`;
+    const link = { id, mode: "review", name: prev.name ?? null, active: true, createdAt: Date.now(), primary, advisor: prev.advisor, reviews: 0, advisories: [], round, roundOf };
+    if (prev.plan) link.plan = true;
+    link.request = `${heading}\n\n${request}`.slice(0, MAX_TEXT - 500);
+    this.s.links[id] = link;
+    logEvent({ op: "link_continue", id, roundOf, round });
+    this.sendReviewRequest(link);
+    return { id, round, advisor: prev.advisor, plan: !!prev.plan };
+  }
+
   op_link_close({ endpoint, linkId }) {
     const closed = [];
     for (const l of Object.values(this.s.links)) {
@@ -371,11 +461,26 @@ class BrokerState {
     return { closed };
   }
 
-  // From the primary's UserPromptSubmit hook: what the user asked this turn
+  // A prompt the bridge itself delivered (a ChatGPT thread runs its queue as
+  // prompts): exactly the text of a message being handed to this chat, and
+  // each delivery matches once, so the same text again is the user's. Limit:
+  // a user pasting a delivery verbatim before its own turn runs takes its place.
+  fromBridge(endpoint, prompt) {
+    const text = prompt.trim();
+    const m = this.s.messages.find((m) => m.dispatch && !m.promptMatched && sameEndpoint(m.toEndpoint, endpoint) && inlineText(m).trim() === text);
+    if (m) m.promptMatched = Date.now();
+    return !!m;
+  }
+
+  // From the primary's UserPromptSubmit hook: what the user asked this turn.
+  // A real user prompt starts a new generation: the fix-loop count starts
+  // over, a stop is lifted, and answers to older requests no longer steer.
   op_turn_start({ endpoint, turnId, prompt }) {
     const link = this.linkFor("primary", endpoint, "advisor");
     if (!link || typeof prompt !== "string") return { skipped: "no link" };
     link.lastPrompt = { turnId: turnId ?? null, text: prompt.slice(0, MAX_PROMPT), at: Date.now() };
+    if (this.fromBridge(endpoint, prompt)) return { ok: true, fromBridge: true };
+    Object.assign(link, { generation: (link.generation ?? 0) + 1, rounds: 0, stopped: false });
     return { ok: true };
   }
 
@@ -388,10 +493,12 @@ class BrokerState {
     const p = link.lastPrompt;
     const prompt = p && (!p.turnId || !turnId || p.turnId === turnId) ? p.text : null;
     delete link.lastPrompt; // never attach an old question to a later turn
-    if (link.awaitingAdvisoryTurn) {
-      link.awaitingAdvisoryTurn = false;
-      logEvent({ op: "turn_end", link: link.id, turnId, skipped: "advisory follow-up" });
-      return { skipped: "advisory follow-up" };
+    // the turn a stop woke, and the turns after it until the user writes,
+    // aren't reviewed: the loop is over until the user decides
+    if (link.stopped || link.awaitingAdvisoryTurn) {
+      delete link.awaitingAdvisoryTurn; // from protocol 7 state
+      logEvent({ op: "turn_end", link: link.id, turnId, skipped: "stopped" });
+      return { skipped: "stopped" };
     }
     link.reviews++;
     if (link.advisor.app === "claude" && !listenerAlive(link.advisor))
@@ -402,51 +509,54 @@ class BrokerState {
         `Your advisor (Claude Code session ${link.advisor.id}) isn't listening, so reviews are waiting. Open that session in Claude Desktop; it picks them up when it starts.`,
       );
     const text = reviewText({ heading: `Primary (${endpoint.app}) finished a turn${turnId ? ` (${turnId})` : ""}.`, prompt, answer: lastMessage ?? "", diff });
-    return this.post({ from: endpoint.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text });
+    return this.post({ from: endpoint.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text, generation: link.generation ?? 0 });
   }
 
-  // From the advisor (bridge_advise), for the review request it last read.
-  // Advisor mode: blocker/concern wake the primary once, nits wait for its
-  // next prompt, repeated notes are dropped. Review mode: the answer always
-  // goes back and the link closes.
-  // The answer is for one request: the one named, or the only open one. With
-  // several open requests (a chat advising more than one link) the request id
-  // is required, so an answer can't land on the wrong link.
-  op_advise({ endpoint, requestId, verdict, severity, note, findings }) {
-    if (!SEVERITIES.includes(severity)) throw new Error(`severity must be one of ${SEVERITIES.join("|")}`);
-    const open = this.s.messages.filter(
-      (m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && !m.answeredAt && this.s.links[m.linkId]?.active,
-    );
-    let req;
-    if (requestId) {
-      req = open.find((m) => m.id === requestId);
-      const other = !req && this.s.messages.find((m) => m.id === requestId && sameEndpoint(m.toEndpoint, endpoint));
-      if (other && other.kind !== "review-request")
-        throw new Error(`${requestId} is a ${other.kind}, not a review request; reply to it with bridge_send`);
-      if (other?.answeredAt) throw new Error(`review request ${requestId} is already answered`);
-      if (!req) throw new Error(`no open review request ${requestId} for this chat (open: ${open.map((m) => m.id).join(", ") || "none"})`);
-    } else if (open.length > 1) {
-      throw new Error(`several review requests are open (${open.map((m) => m.id).join(", ")}); pass request_id`);
-    } else req = open[0];
-    const link = req ? this.s.links[req.linkId] : this.linkFor("advisor", endpoint);
-    if (!link) throw new Error("this chat is not the advisor of an active link");
-    if (req) req.answeredAt = Date.now();
-    const body = [note?.trim(), ...(findings ?? []).map((f) => `- ${typeof f === "string" ? f : JSON.stringify(f)}`)].filter(Boolean).join("\n");
-    const text = `Verdict: ${verdict ?? "-"} · severity: ${severity}\n\n${body || "(nothing to add)"}`;
+  // From the advisor or reviewer (bridge_advise), for one named request.
+  // Review mode: the answer always goes back and the link closes; changes
+  // requested can be continued with the next round (bridge_review round_of).
+  // Advisor mode: changes requested wake the primary, whose next turn is
+  // reviewed again; approval with nits leaves them for its next prompt; plain
+  // approval sends nothing. Past the round cap the primary is told to stop
+  // and ask the user instead.
+  op_advise({ endpoint, requestId, decision, note, blocking = [], nits = [] }) {
+    if (!DECISIONS.includes(decision)) throw new Error(`decision must be one of ${DECISIONS.join("|")}`);
+    if (decision === "approved" && blocking.length) throw new Error("an approval can't have must-fix items; put minor points in nits, or request changes");
+    if (decision === "changes_requested" && !blocking.length) throw new Error("changes requested needs at least one must-fix item; if only nits are left, approve");
+    if (!requestId) throw new Error("request_id is required: the id of the review request you answer (e.g. m9)");
+    const req = this.s.messages.find((m) => m.id === requestId && sameEndpoint(m.toEndpoint, endpoint));
+    if (!req) throw new Error(`no review request ${requestId} for this chat`);
+    if (req.kind !== "review-request") throw new Error(`${requestId} is a ${req.kind}, not a review request; reply to it with bridge_send`);
+    if (req.answeredAt) throw new Error(`review request ${requestId} is already answered`);
+    const link = this.s.links[req.linkId];
+    if (!link?.active) throw new Error(`review request ${requestId} belongs to a closed link`);
+    req.answeredAt = Date.now();
+    const text = renderAnswer({ decision, note, blocking, nits });
+    link.advisories.push({ at: Date.now(), decision, text });
     if (link.mode === "review") {
-      link.advisories.push({ at: Date.now(), verdict, severity, body });
-      Object.assign(link, { active: false, closedAt: Date.now() });
-      return { delivered: "now", text, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, plan: link.plan }) };
+      const lastRound = decision === "changes_requested" && (link.round ?? 1) >= MAX_ROUNDS();
+      Object.assign(link, { active: false, closedAt: Date.now(), decision });
+      const r = this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, plan: link.plan, decision, lastRound });
+      return { delivered: "now", text, ...r };
     }
-    // empty "nothing to say" answers aren't repeats of each other
-    const dup = !!body && link.advisories.some((a) => a.body === body && a.severity === severity);
-    link.advisories.push({ at: Date.now(), verdict, severity, body, dup });
-    if (dup || severity === "none" || !body) return { delivered: "none", dup, text };
-    if (severity === "nit") {
-      this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to: link.primary, kind: "advice", text: body, at: Date.now(), deliveredAt: null });
+    // an answer to a request from before the user's latest prompt is kept,
+    // but no longer steers the primary
+    if ((req.generation ?? 0) !== (link.generation ?? 0)) return { delivered: "none", stale: true, text };
+    if (decision === "approved") {
+      link.rounds = 0;
+      if (!nits.length) return { delivered: "none", text };
+      // the same nits again aren't news
+      if (link.advisories.slice(0, -1).some((a) => a.decision === "approved" && a.text === text)) return { delivered: "none", dup: true, text };
+      this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to: link.primary, kind: "advice", text, at: Date.now(), deliveredAt: null });
       return { delivered: "next prompt", text };
     }
-    link.awaitingAdvisoryTurn = true;
+    if (link.stopped) return { delivered: "none", stopped: true, text };
+    link.rounds = (link.rounds ?? 0) + 1;
+    if (link.rounds >= MAX_ROUNDS()) {
+      link.stopped = true;
+      const stop = `${link.rounds} rounds in a row without approval.\n\n${text}`;
+      return { delivered: "now", text, stopped: true, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "stop", linkId: link.id, text: stop }) };
+    }
     return { delivered: "now", text, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "advisory", linkId: link.id, text }) };
   }
 
@@ -460,8 +570,9 @@ class BrokerState {
     return { ok: true };
   }
 
-  post({ from, toEndpoint, kind, linkId, text, plan }) {
-    const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null, ...(plan && { plan: true }) };
+  post({ from, toEndpoint, kind, linkId, text, plan, decision, lastRound, generation }) {
+    const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
+    Object.assign(msg, plan && { plan: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation });
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
@@ -492,7 +603,7 @@ class BrokerState {
     const out = this.s.messages.filter((m) => m.to === side && !m.readAt && (!m.toEndpoint || sameEndpoint(m.toEndpoint, endpoint)));
     for (const m of out) m.readAt = now;
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
-    return { messages: out.map(({ id, from, kind, linkId, text, ts, plan }) => ({ id, from, kind, linkId, text, ts, ...(plan && { plan }) })) };
+    return { messages: out.map(({ id, from, kind, linkId, text, ts, plan, decision, lastRound }) => ({ id, from, kind, linkId, text, ts, plan, decision, lastRound })) };
   }
 }
 
