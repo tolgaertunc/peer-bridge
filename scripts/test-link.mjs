@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-link-"));
-Object.assign(process.env, { PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7498", PEER_BRIDGE_FAKE_CODEX: "1" });
+Object.assign(process.env, { PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7498", PEER_BRIDGE_FAKE_CODEX: "1", PEER_BRIDGE_CONFIG_DIR: path.join(dir, "config") });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 
@@ -515,6 +515,56 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   } finally {
     fs.rmSync(dir5, { recursive: true, force: true });
   }
+}
+
+// 24. the user's rules file reaches every chat working through the bridge
+// (linked, or answered after its review link closed) through the prompt hook,
+// never inside a peer message, and nothing reaches an unrelated chat
+{
+  const rules = path.join(process.env.PEER_BRIDGE_CONFIG_DIR, "rules.md");
+  fs.mkdirSync(path.dirname(rules), { recursive: true });
+  fs.writeFileSync(rules, "Always answer in Turkish.\n");
+  const ctx = async (endpoint) => {
+    const o = (await runHook(endpoint.app, "prompt", { session_id: endpoint.id, prompt: "hello" })).out;
+    return o ? JSON.parse(o).hookSpecificOutput.additionalContext : "";
+  };
+  assert.equal(await ctx({ app: "openai", id: "gpt-unrelated" }), "", "an unrelated chat gets nothing");
+  const P = { app: "openai", id: "gpt-rules" };
+  await call("link_create", { primary: P, advisor: { app: "claude", id: "claude-rules" } });
+  assert.match(await ctx(P), /Your user's own standing rules for work through peer-bridge \(from .*rules\.md\)[\s\S]*Always answer in Turkish\./);
+  const RQ = { app: "openai", id: "gpt-rules-requester" };
+  const RV = { app: "claude", id: "claude-rules-reviewer" };
+  const rl = await call("link_create", { primary: RQ, mode: "review", advisor: RV, request: "Check." });
+  await call("advise", { endpoint: RV, requestId: state().messages.find((m) => m.linkId === rl.id).id, decision: "approved" });
+  assert.equal(state().links[rl.id].active, false);
+  assert.match(await ctx(RQ), /Always answer in Turkish/, "the answer to a closed review still comes with the rules");
+  const delivered = await until(() => events().find((e) => e.op === "fake-codex-deliver" && e.threadId === RQ.id));
+  assert.doesNotMatch(delivered.text, /Always answer in Turkish/, "rules never travel inside a peer message");
+  // an answer written two days ago but handed over just now still counts
+  {
+    const dir6 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-late-"));
+    try {
+      const old = Date.now() - 2 * 24 * 3600_000;
+      const late = { id: "m1", from: "claude", to: "openai", toEndpoint: RQ, kind: "review-result", linkId: "L1", text: "x", ts: old, readAt: Date.now(), dispatch: { state: "sent", at: Date.now() } };
+      fs.writeFileSync(path.join(dir6, "state.json"), JSON.stringify({ seq: 1, linkSeq: 1, notes: [], links: { L1: { id: "L1", mode: "review", active: false, primary: RQ, advisor: RV, createdAt: old, closedAt: old } }, messages: [late] }));
+      const out = await new Promise((resolve) => {
+        const p = spawn(process.execPath, [hook, "--app", "openai", "--event", "prompt"], { env: { ...process.env, PEER_BRIDGE_DIR: dir6 } });
+        let o = "";
+        p.stdout.on("data", (d) => (o += d));
+        p.on("close", () => resolve(o));
+        p.stdin.end(JSON.stringify({ session_id: RQ.id, prompt: "x", cwd: "." }));
+      });
+      assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /Always answer in Turkish/, "counted from when it was handed over, not written");
+    } finally {
+      fs.rmSync(dir6, { recursive: true, force: true });
+    }
+  }
+  fs.writeFileSync(rules, "x".repeat(9000));
+  assert.match(await ctx(P), /\(Cut at 8000 characters; the file is longer\.\)/);
+  fs.writeFileSync(rules, "  \n");
+  assert.doesNotMatch(await ctx(P), /standing rules/, "an empty file adds nothing");
+  fs.rmSync(rules);
+  console.log("24 rules file: to linked chats and to answered closed reviews, never in peer messages, capped; unrelated chats get nothing");
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));

@@ -113,6 +113,24 @@ npm run doctor
 
 Each problem comes with the fix.
 
+## Your rules
+
+Standing instructions for every agent working through the bridge, in either app, go in one optional markdown file:
+
+- macOS and Linux: `~/.config/peer-bridge/rules.md` (or `$XDG_CONFIG_HOME/peer-bridge/rules.md`)
+- Windows: `%APPDATA%\peer-bridge\rules.md`
+- anywhere else: set `PEER_BRIDGE_CONFIG_DIR`
+
+Write plain sentences, for example:
+
+```markdown
+Always answer in Turkish.
+Never commit without my approval; staging is fine.
+When you review, don't run the tests.
+```
+
+The whole file (up to 8,000 characters) reaches every chat that is linked or has just had a bridge message: with each prompt, and with the bridge's tool results. It never travels inside a message from the other agent, so that agent can't forge it. Your direct instructions in a chat come first. These are instructions, not enforcement: the bridge can't stop an agent from ignoring them. `npm run doctor` shows whether the file is found.
+
 ## Known limits
 
 - A ChatGPT thread runs the bridge's messages as prompts. The bridge recognises its own by their exact text, once each. If you paste one of them verbatim before the bridge's own turn for it runs, your paste counts as the bridge's and the real delivery as yours, which only restarts the fix-loop count.

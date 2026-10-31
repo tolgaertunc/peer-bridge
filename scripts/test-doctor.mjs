@@ -16,6 +16,7 @@ const env = {
   CODEX_HOME: path.join(root, "codex"),
   PEER_BRIDGE_DIR: path.join(root, "data"),
   PEER_BRIDGE_PORT: "7489",
+  PEER_BRIDGE_CONFIG_DIR: path.join(root, "config"),
 };
 for (const d of [env.CLAUDE_CONFIG_DIR, env.CODEX_HOME]) fs.mkdirSync(d);
 fs.writeFileSync(path.join(env.CODEX_HOME, "config.toml"), 'model = "x"\n');
@@ -34,6 +35,12 @@ assert.equal(d.get("Claude Code", "MCP server").status, "fail");
 assert.equal(d.get("Claude Code", "Stop hook (stop)").status, "fail");
 assert.equal(d.get("ChatGPT Desktop", "MCP server").status, "fail");
 assert.equal(d.get("Broker", "owner").status, "warn");
+assert.match(d.get("Rules", "rules file").detail, /^none/, "no rules file: reported, not a problem");
+fs.mkdirSync(env.PEER_BRIDGE_CONFIG_DIR);
+fs.writeFileSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "rules.md"), "x".repeat(9000));
+assert.equal(doctor().get("Rules", "rules file").status, "warn", "a file over the cap is flagged");
+fs.writeFileSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "rules.md"), "Answer in Turkish.");
+assert.equal(doctor().get("Rules", "rules file").status, "ok");
 console.log(`doctor 1 nothing installed: ${d.report.fails} problems reported, exit 1`);
 
 // installed into the throwaway configs: Claude side clean; Codex hooks are

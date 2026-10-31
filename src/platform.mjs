@@ -25,6 +25,14 @@ export function dataDir() {
   return path.join(process.env.XDG_STATE_HOME || path.join(home, ".local", "state"), "peer-bridge");
 }
 
+// The user's own settings for the bridge (rules.md), apart from its state
+export function configDir() {
+  if (process.env.PEER_BRIDGE_CONFIG_DIR) return process.env.PEER_BRIDGE_CONFIG_DIR;
+  if (IS_WIN) return path.join(winAppData(), "peer-bridge");
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "peer-bridge");
+}
+export const rulesFile = () => path.join(configDir(), "rules.md");
+
 export const codexHome = () => process.env.CODEX_HOME || path.join(home, ".codex");
 export const claudeConfigDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude");
 

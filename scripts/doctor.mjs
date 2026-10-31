@@ -9,7 +9,8 @@ import path from "node:path";
 import http from "node:http";
 import { execFileSync, spawnSync } from "node:child_process";
 import { DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, PROTOCOL, readState, activeLinks } from "../src/broker.mjs";
-import { IS_WIN, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli, locateCodexCli } from "../src/platform.mjs";
+import { readRules, MAX_RULES } from "../src/rules.mjs";
+import { IS_WIN, rulesFile, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli, locateCodexCli } from "../src/platform.mjs";
 
 const asJson = process.argv.includes("--json");
 const root = path.resolve(import.meta.dirname, "..");
@@ -35,6 +36,15 @@ const REINSTALL = "Run `node scripts/install.mjs` from this checkout, then resta
   } catch {
     warn(A, "git", "not found", "Install git; without it review requests carry no diffs.");
   }
+}
+
+// ------------------------------------------------------------------- rules
+{
+  const A = "Rules";
+  const r = readRules();
+  if (!r) ok(A, "rules file", `none (optional: ${rulesFile()})`);
+  else if (r.truncated) warn(A, "rules file", `${r.path}, ${r.size} characters`, `Only the first ${MAX_RULES} reach the agents; shorten it.`);
+  else ok(A, "rules file", `${r.path}, ${r.size} characters`);
 }
 
 // ------------------------------------------------------------------ broker
