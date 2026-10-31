@@ -567,5 +567,26 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   console.log("24 rules file: to linked chats and to answered closed reviews, never in peer messages, capped; unrelated chats get nothing");
 }
 
+// 25. only a Claude Desktop session id is kept for opening a session
+await assert.rejects(call("host", { endpoint: { app: "claude", id: "c" }, hostId: "last" }), /not a Claude Desktop session id/);
+await assert.rejects(call("host", { endpoint: { app: "openai", id: "g" }, hostId: "local_x" }), /not a Claude Desktop session id/);
+await call("host", { endpoint: { app: "claude", id: "c" }, hostId: "local_c-1" });
+assert.equal((await call("reach", { endpoint: { app: "claude", id: "c" } })).hostId, "local_c-1");
+console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude chats");
+
+// 26. bridge_send goes to the link that was checked before sending, even if a
+// newer link appears in between; a link closed meanwhile is refused
+{
+  const S = { app: "claude", id: "claude-sender" };
+  const a = await call("link_create", { primary: S, advisor: { app: "openai", id: "gpt-checked" } });
+  const checked = await call("send_target", { endpoint: S });
+  await call("link_create", { primary: S, mode: "review", advisor: { app: "openai", id: "gpt-newer" }, request: "x" });
+  const sent = await call("send", { endpoint: S, text: "hi", linkId: checked.linkId });
+  assert.deepEqual(sent.to, { app: "openai", id: "gpt-checked" });
+  await call("link_close", { linkId: a.id });
+  await assert.rejects(call("send", { endpoint: S, text: "hi", linkId: a.id }), /no longer open for this chat; try again/);
+  console.log("26 bridge_send: to the checked link, not a newer one; refused if it closed meanwhile");
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);

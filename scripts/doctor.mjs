@@ -10,6 +10,7 @@ import http from "node:http";
 import { execFileSync, spawnSync } from "node:child_process";
 import { DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, PROTOCOL, readState, activeLinks } from "../src/broker.mjs";
 import { readRules, MAX_RULES } from "../src/rules.mjs";
+import { readConfig } from "../src/config.mjs";
 import { IS_WIN, rulesFile, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli, locateCodexCli } from "../src/platform.mjs";
 
 const asJson = process.argv.includes("--json");
@@ -45,6 +46,7 @@ const REINSTALL = "Run `node scripts/install.mjs` from this checkout, then resta
   if (!r) ok(A, "rules file", `none (optional: ${rulesFile()})`);
   else if (r.truncated) warn(A, "rules file", `${r.path}, ${r.size} characters`, `Only the first ${MAX_RULES} reach the agents; shorten it.`);
   else ok(A, "rules file", `${r.path}, ${r.size} characters`);
+  ok(A, "closed apps", readConfig().openClosedApps === "always" ? "opened without asking (always)" : "the user is asked first (ask)");
 }
 
 // ------------------------------------------------------------------ broker
@@ -283,7 +285,7 @@ function runs(cmd, shell) {
     const ends = `${l.primary.app} ${l.primary.id.slice(0, 8)}… → ${l.advisor ? `${l.advisor.app} ${l.advisor.id.slice(0, 8)}…` : "(waiting for join)"}`;
     const problems = [];
     if (l.health && !l.health.ok) problems.push(`last delivery failed: ${l.health.error}`);
-    for (const role of ["primary", "advisor"]) if (l[role]?.app === "claude" && !listening(l[role])) problems.push(`Claude ${role} not listening`);
+    for (const role of ["primary", "advisor"]) if (l[role]?.app === "claude" && !listening(l[role])) problems.push(`Claude ${role} not listening${state?.hosts?.[l[role].id] ? "" : ", and the bridge can't open it (no Claude Desktop id)"}`);
     problems.length
       ? warn(A, `${l.id} (${l.mode})`, `${ends}; ${problems.join("; ")}`, "Open the Claude Code session in Claude Desktop (it re-arms on its next turn or start); check ChatGPT Desktop is installed and signed in.")
       : ok(A, `${l.id} (${l.mode})`, ends);

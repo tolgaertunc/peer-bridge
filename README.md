@@ -131,6 +131,14 @@ When you review, don't run the tests.
 
 The whole file (up to 8,000 characters) reaches every chat that is linked or has just had a bridge message: with each prompt, and with the bridge's tool results. It never travels inside a message from the other agent, so that agent can't forge it. Your direct instructions in a chat come first. These are instructions, not enforcement: the bridge can't stop an agent from ignoring them. `npm run doctor` shows whether the file is found.
 
+## When the other side is closed
+
+When an agent starts something with the other side (`bridge_review`, `bridge_link` to ChatGPT, `bridge_send`) and that side is closed, nothing is sent. The agent is told to ask you, and if you agree it calls again with `open=true`: the bridge opens ChatGPT Desktop, or the exact Claude Code session in Claude Desktop (`claude://code/continue`), and then sends. Say "always" and it passes `remember=true`, which sets `"openClosedApps": "always"` in `config.json` next to `rules.md`; from then on closed apps are opened without asking.
+
+- "Closed" means ChatGPT Desktop isn't running, or the Claude session isn't listening.
+- A Claude session can only be opened if its own bridge server has reported Claude Desktop's id for it; otherwise you're asked to open it by hand.
+- Messages the bridge sends on its own (an advisor's review of each turn, an answer coming back) don't ask: a closed Claude session's message waits for it as before, and ChatGPT is still started by its wake link.
+
 ## Known limits
 
 - A ChatGPT thread runs the bridge's messages as prompts. The bridge recognises its own by their exact text, once each. If you paste one of them verbatim before the bridge's own turn for it runs, your paste counts as the bridge's and the real delivery as yours, which only restarts the fix-loop count.
