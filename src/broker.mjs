@@ -26,7 +26,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 6);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 7);
 
 export const SIDES = ["claude", "openai"];
 const MAX_TEXT = 40_000;
@@ -102,19 +102,25 @@ function listenerAlive(endpoint) {
 // What the woken chat sees; self-contained so it works after compaction
 export function wakeText(m) {
   if (m.kind === "review-request")
-    return `[PEER-BRIDGE] Review request ${m.id} (link ${m.linkId}) from ${m.from} is waiting. Call bridge_receive to read it, review it, then call bridge_advise with your verdict.`;
+    return `[PEER-BRIDGE] ${m.plan ? "Plan review" : "Review"} request ${m.id} (link ${m.linkId}) from ${m.from} is waiting. Call bridge_receive to read it, review it, then call bridge_advise with your verdict.`;
   if (m.kind === "advisory")
     return `[PEER-BRIDGE] Your advisor (${m.from}) flagged your last turn: ${m.id} (link ${m.linkId}). Call bridge_receive to read it, then address it or explain why not.`;
   if (m.kind === "review-result")
-    return `[PEER-BRIDGE] The review you asked for is ready: ${m.id} (link ${m.linkId}) from ${m.from}. Call bridge_receive to read it.`;
+    return `[PEER-BRIDGE] The ${m.plan ? "plan review" : "review"} you asked for is ready: ${m.id} (link ${m.linkId}) from ${m.from}. Call bridge_receive to read it.${m.plan ? ` ${nextStep(m)}` : ""}`;
   return `[PEER-BRIDGE] New message ${m.id} from ${m.from} is waiting. Call bridge_receive to read it. ${nextStep(m)}`;
 }
+
+// The bridge's own rule after a plan review, never the reviewer's words: the
+// reviewer's verdict is not the user's approval.
+export const PLAN_GATE =
+  "This was a plan review: show the user the plan as it now stands and the reviewer's verdict, then wait for the user's explicit approval in this chat before implementing anything.";
 
 // What to do with a message, by kind. A plain message is not a review
 // request, so it is answered with bridge_send, never bridge_advise.
 function nextStep(m) {
-  if (m.kind === "review-request") return `Review it, then answer once with bridge_advise (request_id ${m.id}).`;
+  if (m.kind === "review-request") return `Review ${m.plan ? "the plan" : "it"}, then answer once with bridge_advise (request_id ${m.id}).`;
   if (m.kind === "advisory") return "Address it, or tell the user why not.";
+  if (m.kind === "review-result" && m.plan) return PLAN_GATE;
   if (m.kind === "review-result") return "Weigh it, act on what holds up, and tell the user what you changed or why you didn't.";
   return "It is a message, not a review request: if it needs a reply, send one with bridge_send (not bridge_advise).";
 }
@@ -126,9 +132,9 @@ const LABEL = { claude: "CLAUDE", openai: "CODEX" };
 // line keeps it from passing as the user's own words.
 export function inlineText(m) {
   const title = {
-    "review-request": `Review request ${m.id}`,
+    "review-request": `${m.plan ? "Plan review" : "Review"} request ${m.id}`,
     advisory: `Your advisor flagged your last turn: ${m.id}`,
-    "review-result": `The review you asked for: ${m.id}`,
+    "review-result": `The ${m.plan ? "plan review" : "review"} you asked for: ${m.id}`,
   }[m.kind] ?? `Message ${m.id}`;
   return [
     `${LABEL[m.from] ?? m.from.toUpperCase()}: ${title} (link ${m.linkId})`,
@@ -318,7 +324,7 @@ class BrokerState {
   // mode "advisor": every turn of the primary is reviewed; one per primary.
   // mode "review": one request, one answer, then the link closes.
   // The advisor is bound now (a thread the bridge created) or later via code.
-  op_link_create({ primary, advisor, mode = "advisor", name, request }) {
+  op_link_create({ primary, advisor, mode = "advisor", name, request, plan }) {
     if (!primary?.app || !primary?.id) throw new Error("primary endpoint unknown (caller identity missing)");
     if (mode === "advisor")
       for (const l of Object.values(this.s.links))
@@ -327,6 +333,7 @@ class BrokerState {
     const link = { id, mode, name: name ?? null, active: true, createdAt: Date.now(), primary, advisor: advisor ?? null, reviews: 0, advisories: [] };
     if (!advisor) link.joinCode = crypto.randomBytes(3).toString("hex");
     if (request) link.request = request.slice(0, MAX_TEXT - 500);
+    if (mode === "review" && plan) link.plan = true; // a plan to review, not code
     this.s.links[id] = link;
     logEvent({ op: "link_create", id, mode, primary, advisor: advisor ?? null });
     if (advisor) this.sendReviewRequest(link);
@@ -341,13 +348,13 @@ class BrokerState {
     delete link.joinCode;
     logEvent({ op: "link_join", id: link.id, advisor: endpoint });
     this.sendReviewRequest(link);
-    return { id: link.id, mode: link.mode, primary: link.primary };
+    return { id: link.id, mode: link.mode, primary: link.primary, ...(link.plan && { plan: true }) };
   }
 
   // the one request of a "review" link, once its reviewer is known
   sendReviewRequest(link) {
     if (link.mode !== "review" || !link.request || !link.advisor) return;
-    this.post({ from: link.primary.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text: link.request });
+    this.post({ from: link.primary.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text: link.request, plan: link.plan });
     delete link.request;
   }
 
@@ -429,7 +436,7 @@ class BrokerState {
     if (link.mode === "review") {
       link.advisories.push({ at: Date.now(), verdict, severity, body });
       Object.assign(link, { active: false, closedAt: Date.now() });
-      return { delivered: "now", text, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text }) };
+      return { delivered: "now", text, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, plan: link.plan }) };
     }
     // empty "nothing to say" answers aren't repeats of each other
     const dup = !!body && link.advisories.some((a) => a.body === body && a.severity === severity);
@@ -453,8 +460,8 @@ class BrokerState {
     return { ok: true };
   }
 
-  post({ from, toEndpoint, kind, linkId, text }) {
-    const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
+  post({ from, toEndpoint, kind, linkId, text, plan }) {
+    const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null, ...(plan && { plan: true }) };
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
@@ -485,7 +492,7 @@ class BrokerState {
     const out = this.s.messages.filter((m) => m.to === side && !m.readAt && (!m.toEndpoint || sameEndpoint(m.toEndpoint, endpoint)));
     for (const m of out) m.readAt = now;
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
-    return { messages: out.map(({ id, from, kind, linkId, text, ts }) => ({ id, from, kind, linkId, text, ts })) };
+    return { messages: out.map(({ id, from, kind, linkId, text, ts, plan }) => ({ id, from, kind, linkId, text, ts, ...(plan && { plan }) })) };
   }
 }
 

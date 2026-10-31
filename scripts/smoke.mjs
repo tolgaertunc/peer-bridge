@@ -137,6 +137,43 @@ await call(openai, "bridge_advise", { request_id: againReq.match(/Review request
 assert.match(await receiveUntil(claude, undefined, /kind=review-result/), /severity: none/);
 console.log(`5a review ${again.id} continued in the earlier reviewer thread`);
 
+// 5a2. a plan review: no diff by default, the reviewer is told it's a plan,
+// and the requester is told to wait for the user's approval, by the bridge
+// itself and not by the reviewer
+const planRev = (await call(claude, "bridge_review", { reviewer: "join", kind: "plan", request: "Plan: 1) add trim 2) add tests" })).structuredContent;
+assert.match(textOf(await call(openai, "bridge_link_join", { code: planRev.joinCode }, asGpt("gpt-thread-planner"))), /Joined plan review/);
+const planReq = await deliveredTo("gpt-thread-planner", /add trim/);
+assert.match(planReq, /^CLAUDE: Plan review request (m\d+)/);
+assert.match(planReq, /This is a plan, not finished work/);
+assert.doesNotMatch(planReq, /Uncommitted changes/, "a plan review attaches no diff by default");
+await call(openai, "bridge_advise", { request_id: planReq.match(/Plan review request (m\d+)/)[1], verdict: "unclear", severity: "concern", note: "Tests first." }, asGpt("gpt-thread-planner"));
+const planRes = await receiveUntil(claude, undefined, /kind=review-result plan/);
+assert.match(planRes, /Tests first\./);
+assert.match(planRes, /wait for the user's explicit approval in this chat before implementing anything\.$/);
+console.log(`5a2 plan review ${planRev.id}: no diff, plan guidance sent, requester told to wait for the user's approval`);
+
+// 5a3. a plan result read together with a review request (this chat is also
+// reviewing for someone else) still carries the plan gate, in either order
+for (const planFirst of [true, false]) {
+  const doPlan = async () => {
+    const pr = (await call(claude, "bridge_review", { reviewer: "join", kind: "plan", request: "Plan: mixed batch" })).structuredContent;
+    await call(openai, "bridge_link_join", { code: pr.joinCode }, asGpt("gpt-thread-planner"));
+    const q = await deliveredTo("gpt-thread-planner", new RegExp(`\\(link ${pr.id}\\)`));
+    await call(openai, "bridge_advise", { request_id: q.match(/Plan review request (m\d+)/)[1], verdict: "correct", severity: "none", note: "" }, asGpt("gpt-thread-planner"));
+  };
+  const doRequest = async () => {
+    const gr = (await call(openai, "bridge_review", { reviewer: "join", request: "Review for the mixed batch" }, asGpt(THREAD))).structuredContent;
+    await call(claude, "bridge_link_join", { code: gr.joinCode });
+  };
+  if (planFirst) await doPlan(), await doRequest();
+  else await doRequest(), await doPlan();
+  const mixed = await receiveUntil(claude, undefined, /kind=review-result plan[\s\S]*kind=review-request|kind=review-request[\s\S]*kind=review-result plan/);
+  assert.match(mixed, /answer each with bridge_advise/);
+  assert.match(mixed, /wait for the user's explicit approval in this chat before implementing anything\./);
+  await call(claude, "bridge_advise", { request_id: mixed.match(/id=(m\d+) kind=review-request/)[1], verdict: "correct", severity: "none", note: "" });
+}
+console.log("5a3 plan gate kept when a plan result and a review request are read together, either order");
+
 // 5b. bridge_send goes to the linked chat (and so wakes it); a plain message
 // answered with bridge_advise gets told to use bridge_send; no link, no send
 await call(claude, "bridge_send", { text: "Heads up: I'm also changing the tokenizer." });
