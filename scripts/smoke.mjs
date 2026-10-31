@@ -109,8 +109,8 @@ assert.equal(textOf(await call(openai, "bridge_receive", {}, asGpt(THREAD))), "N
 console.log("3 review request shown in full in the ChatGPT thread: question, answer, turn's diff; .env, .envrc, secrets/ left out");
 
 // 4. advisor raises a concern → Claude gets it
-const advised = textOf(await call(openai, "bridge_advise", { request_id: reqId, verdict: "incorrect", severity: "concern", note: "Empty fields are kept; filter them out?" }, asGpt(THREAD)));
-assert.match(advised, /write this as your reply, unchanged:\n\nVerdict: incorrect · severity: concern\n\nEmpty fields are kept/, "the advisor gets its answer back to show the user");
+const advised = textOf(await call(openai, "bridge_advise", { request_id: reqId, decision: "changes_requested", blocking: [{ title: "Empty fields are kept; filter them out?" }] }, asGpt(THREAD)));
+assert.match(advised, /write this as your reply, unchanged:\n\n\[CHANGES REQUESTED\]\n\nMust fix:\n- Empty fields are kept/, "the advisor gets its answer back to show the user");
 assert.match(await receiveUntil(claude, undefined, /kind=advisory/), /Empty fields are kept/);
 console.log("4 concern delivered to the Claude primary; the advisor is told to show it in its chat");
 
@@ -122,7 +122,7 @@ assert.match(revReq, /Is the trim change safe for quoted CSV\?/);
 assert.match(revReq, /Uncommitted changes in .*:/);
 assert.doesNotMatch(revReq, /super-secret/);
 const revId = revReq.match(/Review request (m\d+)/)[1];
-await call(openai, "bridge_advise", { request_id: revId, verdict: "unclear", severity: "nit", note: "Quoted fields with commas will still split." }, asGpt(REVIEWER));
+await call(openai, "bridge_advise", { request_id: revId, decision: "approved", nits: [{ title: "Quoted fields with commas will still split." }] }, asGpt(REVIEWER));
 assert.match(await receiveUntil(claude, undefined, /kind=review-result/), /Quoted fields with commas/);
 const status = JSON.parse(textOf(await call(claude, "bridge_status")));
 assert.equal(status.chat.id, SESSION);
@@ -133,8 +133,8 @@ console.log(`5 one-off review ${rev.id}: request with diff → answer back → l
 const again = (await call(claude, "bridge_review", { reviewer: "openai", thread_id: REVIEWER, include_diff: false, request: "And now with quotes handled?" })).structuredContent;
 assert.equal(again.threadId, REVIEWER);
 const againReq = await deliveredTo(REVIEWER, /And now with quotes handled\?/);
-await call(openai, "bridge_advise", { request_id: againReq.match(/Review request (m\d+)/)[1], verdict: "correct", severity: "none", note: "" }, asGpt(REVIEWER));
-assert.match(await receiveUntil(claude, undefined, /kind=review-result/), /severity: none/);
+await call(openai, "bridge_advise", { request_id: againReq.match(/Review request (m\d+)/)[1], decision: "approved" }, asGpt(REVIEWER));
+assert.match(await receiveUntil(claude, undefined, /kind=review-result/), /\[APPROVED\][\s\S]*Approved; the nits are optional\./);
 console.log(`5a review ${again.id} continued in the earlier reviewer thread`);
 
 // 5a2. a plan review: no diff by default, the reviewer is told it's a plan,
@@ -146,7 +146,7 @@ const planReq = await deliveredTo("gpt-thread-planner", /add trim/);
 assert.match(planReq, /^CLAUDE: Plan review request (m\d+)/);
 assert.match(planReq, /This is a plan, not finished work/);
 assert.doesNotMatch(planReq, /Uncommitted changes/, "a plan review attaches no diff by default");
-await call(openai, "bridge_advise", { request_id: planReq.match(/Plan review request (m\d+)/)[1], verdict: "unclear", severity: "concern", note: "Tests first." }, asGpt("gpt-thread-planner"));
+await call(openai, "bridge_advise", { request_id: planReq.match(/Plan review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "Tests first." }] }, asGpt("gpt-thread-planner"));
 const planRes = await receiveUntil(claude, undefined, /kind=review-result plan/);
 assert.match(planRes, /Tests first\./);
 assert.match(planRes, /wait for the user's explicit approval in this chat before implementing anything\.$/);
@@ -159,7 +159,7 @@ for (const planFirst of [true, false]) {
     const pr = (await call(claude, "bridge_review", { reviewer: "join", kind: "plan", request: "Plan: mixed batch" })).structuredContent;
     await call(openai, "bridge_link_join", { code: pr.joinCode }, asGpt("gpt-thread-planner"));
     const q = await deliveredTo("gpt-thread-planner", new RegExp(`\\(link ${pr.id}\\)`));
-    await call(openai, "bridge_advise", { request_id: q.match(/Plan review request (m\d+)/)[1], verdict: "correct", severity: "none", note: "" }, asGpt("gpt-thread-planner"));
+    await call(openai, "bridge_advise", { request_id: q.match(/Plan review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-thread-planner"));
   };
   const doRequest = async () => {
     const gr = (await call(openai, "bridge_review", { reviewer: "join", request: "Review for the mixed batch" }, asGpt(THREAD))).structuredContent;
@@ -168,11 +168,24 @@ for (const planFirst of [true, false]) {
   if (planFirst) await doPlan(), await doRequest();
   else await doRequest(), await doPlan();
   const mixed = await receiveUntil(claude, undefined, /kind=review-result plan[\s\S]*kind=review-request|kind=review-request[\s\S]*kind=review-result plan/);
-  assert.match(mixed, /answer each with bridge_advise/);
+  assert.match(mixed, /answer once with bridge_advise \(request_id m\d+\)/);
   assert.match(mixed, /wait for the user's explicit approval in this chat before implementing anything\./);
-  await call(claude, "bridge_advise", { request_id: mixed.match(/id=(m\d+) kind=review-request/)[1], verdict: "correct", severity: "none", note: "" });
+  await call(claude, "bridge_advise", { request_id: mixed.match(/id=(m\d+) kind=review-request/)[1], decision: "approved" });
 }
 console.log("5a3 plan gate kept when a plan result and a review request are read together, either order");
+
+// 5a4. the next round of the plan review from 5a2: round_of alone, same
+// reviewer, still a plan review
+const round2 = (await call(claude, "bridge_review", { round_of: planRev.id, request: "Moved the tests first. Kept trim before tests: it's one line." })).structuredContent;
+assert.equal(round2.round, 2);
+const r2req = await deliveredTo("gpt-thread-planner", /Moved the tests first/);
+assert.match(r2req, new RegExp(`^CLAUDE: Plan review request m\\d+ \\(link ${round2.id}\\)\\n\\nRound 2 of review ${planRev.id}`));
+assert.match(r2req, /This is a plan, not finished work/);
+const again2 = await claude.callTool({ name: "bridge_review", arguments: { round_of: planRev.id, request: "twice" } });
+assert.ok(again2.isError && /already continued/.test(textOf(again2)), textOf(again2));
+await call(openai, "bridge_advise", { request_id: r2req.match(/Plan review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-thread-planner"));
+assert.match(await receiveUntil(claude, undefined, new RegExp(`kind=review-result plan decision=approved link=${round2.id}`)), /Approved; the nits are optional\. This was a plan review/);
+console.log(`5a4 round 2 (${round2.id}) of plan review ${planRev.id}: same reviewer, still a plan, approved; a second continuation refused`);
 
 // 5b. bridge_send goes to the linked chat (and so wakes it); a plain message
 // answered with bridge_advise gets told to use bridge_send; no link, no send
@@ -180,7 +193,7 @@ await call(claude, "bridge_send", { text: "Heads up: I'm also changing the token
 const plain = await deliveredTo(THREAD, /changing the tokenizer/);
 assert.match(plain, /^CLAUDE: Message (m\d+)/);
 assert.match(plain, /not a review request: if it needs a reply, send one with bridge_send \(not bridge_advise\)/);
-const wrongTool = await openai.callTool({ name: "bridge_advise", arguments: { request_id: plain.match(/Message (m\d+)/)[1], verdict: "correct", severity: "nit", note: "ok" }, _meta: asGpt(THREAD) });
+const wrongTool = await openai.callTool({ name: "bridge_advise", arguments: { request_id: plain.match(/Message (m\d+)/)[1], decision: "approved" }, _meta: asGpt(THREAD) });
 assert.ok(wrongTool.isError && /is a message, not a review request; reply to it with bridge_send/.test(textOf(wrongTool)), textOf(wrongTool));
 const lonely = await openai.callTool({ name: "bridge_send", arguments: { text: "hello?" }, _meta: asGpt("gpt-thread-unlinked") });
 assert.ok(lonely.isError && /no active link/.test(textOf(lonely)));
@@ -192,7 +205,7 @@ await call(claude, "bridge_link_join", { code: gptRev.joinCode });
 const gptReq = await receiveUntil(claude, undefined, /kind=review-request/);
 assert.match(gptReq, /not attached: this chat's project folder is unknown/);
 assert.doesNotMatch(gptReq, /parser\.js/);
-await call(claude, "bridge_advise", { verdict: "correct", severity: "none", note: "" });
+await call(claude, "bridge_advise", { request_id: gptReq.match(/id=(m\d+) kind=review-request/)[1], decision: "approved" });
 console.log("5c ChatGPT-side review without a known project folder attaches no diff");
 
 // 6. status from the ChatGPT side knows its own chat; unlink ends reviews
