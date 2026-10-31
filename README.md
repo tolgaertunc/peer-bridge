@@ -143,3 +143,7 @@ npm test
   - `send.mjs`, `codex-thread.mjs`: debugging helpers.
 - `TEST.md`: lab notebook (in Turkish) with the experiments and measurements behind this design.
 - `docs/`: research notes.
+
+## License
+
+[MIT](LICENSE)

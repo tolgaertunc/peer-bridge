@@ -22,7 +22,7 @@
     "agents"
   ],
   "author": "Tolga Ertunc",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=22"
   },
