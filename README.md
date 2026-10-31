@@ -141,8 +141,7 @@ npm test
   - `install.mjs`, `doctor.mjs`
   - the tests
   - `send.mjs`, `codex-thread.mjs`: debugging helpers.
-- `TEST.md`: lab notebook (in Turkish) with the experiments and measurements behind this design.
-- `docs/`: research notes.
+- `docs/notes/`: working notes (in Turkish) with the experiments and measurements behind this design.
 
 ## License
 
