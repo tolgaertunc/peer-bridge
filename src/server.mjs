@@ -15,6 +15,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { call, keepOwner, SIDES, MAX_DIFF, nextStep } from "./broker.mjs";
 import { identify, endpointOf } from "./caller.mjs";
 import { turnDiff } from "./git.mjs";
+import { rulesBlock } from "./rules.mjs";
 
 const sideArg = process.argv.indexOf("--side");
 const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.PEER_BRIDGE_SIDE;
@@ -34,6 +35,12 @@ const LOCAL = { readOnlyHint: false, destructiveHint: false, idempotentHint: fal
 const READ_ONLY = { ...LOCAL, readOnlyHint: true, idempotentHint: true };
 
 const text = (t, structuredContent) => ({ content: [{ type: "text", text: t }], ...(structuredContent && { structuredContent }) });
+// a tool result with the user's own rules after it (a local channel the
+// other agent can't write to)
+const withRules = (t, structuredContent, { first = false } = {}) => {
+  const rules = rulesBlock();
+  return text(!rules ? t : first ? `${rules}\n\n${t}` : `${t}\n\n${rules}`, structuredContent);
+};
 
 const server = new McpServer({ name: "peer-bridge", version: "0.1.0" });
 
@@ -70,7 +77,7 @@ server.registerTool(
     // the bridge's own instruction for each message, so a mixed batch keeps
     // them all (the plan gate among them)
     const next = [...new Set(r.messages.map(nextStep))];
-    return text(`${PEER_RULES}\n\n${body}\n\n${next.join("\n")}`);
+    return withRules(`${PEER_RULES}\n\n${body}\n\n${next.join("\n")}`);
   },
 );
 
@@ -114,7 +121,7 @@ server.registerTool(
     if (!primary) return text("Can't tell which chat this is, so it can't be linked.");
     if (advisor === "join") {
       const r = await call("link_create", { primary });
-      return text(
+      return withRules(
         `Link ${r.id} created. In the chat that should advise this one (either app), ask it to call bridge_link_join with code ${r.joinCode}.`,
         r,
       );
@@ -126,7 +133,7 @@ server.registerTool(
       threadId = (await createThread({ model, effort, name: name ?? "Peer bridge · Advisor", seed: ADVISOR_BRIEF, sandbox: "read-only" })).threadId;
     }
     const r = await call("link_create", { primary, advisor: { app: "openai", id: threadId } });
-    return text(
+    return withRules(
       `Link ${r.id}: ChatGPT thread ${threadId} now advises this chat. Each of your turns is sent for review automatically ` +
         "(Stop hook); concerns come back as a new turn, nits with the user's next prompt.",
       { ...r, threadId },
@@ -211,7 +218,7 @@ server.registerTool(
       const plan = kind ? kind === "plan" : info.plan;
       const req = reviewRequest(request, include_diff ?? !plan, extra, plan);
       const r = await call("link_continue", { primary, roundOf: round_of, request: req, plan: kind ? plan : undefined, threadId: thread_id });
-      return text(`Round ${r.round} (${r.id}) sent to the reviewer of ${round_of} (${r.advisor.app} chat ${r.advisor.id}). The answer arrives as a new turn when it's ready.`, r);
+      return withRules(`Round ${r.round} (${r.id}) sent to the reviewer of ${round_of} (${r.advisor.app} chat ${r.advisor.id}). The answer arrives as a new turn when it's ready.`, r);
     }
     if (!reviewer) return text("Say where the reviewer runs (reviewer), or continue an earlier review with round_of.");
     const plan = kind === "plan";
@@ -219,7 +226,7 @@ server.registerTool(
     const what = plan ? "Plan review" : "Review";
     if (reviewer === "join") {
       const r = await call("link_create", { primary, mode: "review", request: req, plan });
-      return text(`${what} ${r.id} is waiting for a reviewer. In the chat that should review (either app), ask it to call bridge_link_join with code ${r.joinCode}.`, r);
+      return withRules(`${what} ${r.id} is waiting for a reviewer. In the chat that should review (either app), ask it to call bridge_link_join with code ${r.joinCode}.`, r);
     }
     let threadId = thread_id;
     if (!threadId) {
@@ -228,7 +235,7 @@ server.registerTool(
     }
     const r = await call("link_create", { primary, mode: "review", advisor: { app: "openai", id: threadId }, request: req, plan });
     const where = thread_id ? `ChatGPT thread ${threadId}` : `a new ChatGPT thread (${threadId}${model ? `, ${model}` : ""}${effort ? `, effort ${effort}` : ""})`;
-    return text(
+    return withRules(
       `${what} ${r.id} sent to ${where}. The answer arrives as a new turn when it's ready. To continue in that chat later, pass thread_id ${threadId}.`,
       { ...r, threadId },
     );
@@ -248,13 +255,13 @@ server.registerTool(
     if (!endpoint) return text("Can't tell which chat this is, so it can't join.");
     const r = await call("link_join", { code: code.trim(), endpoint });
     if (r.mode === "review")
-      return text(
+      return withRules(
         `Joined ${r.plan ? "plan review" : "review"} ${r.id} for ${r.primary.app} chat ${r.primary.id}. ` +
           (SIDE === "openai" ? "Its request arrives as the next message in this chat." : "Its request is waiting: call bridge_receive now.") +
           `\n\n${REVIEWER_BRIEF}`,
         r,
       );
-    return text(`Joined link ${r.id} as advisor of ${r.primary.app} chat ${r.primary.id}.\n\n${ADVISOR_BRIEF}`, r);
+    return withRules(`Joined link ${r.id} as advisor of ${r.primary.app} chat ${r.primary.id}.\n\n${ADVISOR_BRIEF}`, r);
   },
 );
 
@@ -296,7 +303,7 @@ server.registerTool(
     const how = { none: "Recorded; nothing sent.", "next prompt": "Will reach the primary with the user's next prompt.", now: "Sent; the other chat is being woken." };
     if (r.dup) return text("Same nits as before; not sent again.", r);
     // the user can't see tool calls, so the answer goes into the chat too
-    return text(`${how[r.delivered]} The user can't see tool calls: write this as your reply, unchanged:\n\n${r.text}`, r);
+    return withRules(`${how[r.delivered]} The user can't see tool calls: write this as your reply, unchanged:\n\n${r.text}`, r, { first: true });
   },
 );
 

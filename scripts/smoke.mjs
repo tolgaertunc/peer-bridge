@@ -13,7 +13,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-smoke-"));
 const repo = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-repo-"));
-const env = { ...process.env, PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7496", PEER_BRIDGE_FAKE_CODEX: "1" };
+const env = { ...process.env, PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7496", PEER_BRIDGE_FAKE_CODEX: "1", PEER_BRIDGE_CONFIG_DIR: path.join(dir, "config") };
+fs.mkdirSync(env.PEER_BRIDGE_CONFIG_DIR);
+fs.writeFileSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "rules.md"), "Never commit without asking me.\n");
 const server = path.resolve(import.meta.dirname, "../src/server.mjs");
 const hook = path.resolve(import.meta.dirname, "../src/hook.mjs");
 const SESSION = "claude-session-smoke";
@@ -110,8 +112,10 @@ console.log("3 review request shown in full in the ChatGPT thread: question, ans
 
 // 4. advisor raises a concern → Claude gets it
 const advised = textOf(await call(openai, "bridge_advise", { request_id: reqId, decision: "changes_requested", blocking: [{ title: "Empty fields are kept; filter them out?" }] }, asGpt(THREAD)));
-assert.match(advised, /write this as your reply, unchanged:\n\n\[CHANGES REQUESTED\]\n\nMust fix:\n- Empty fields are kept/, "the advisor gets its answer back to show the user");
-assert.match(await receiveUntil(claude, undefined, /kind=advisory/), /Empty fields are kept/);
+assert.match(advised, /write this as your reply, unchanged:\n\n\[CHANGES REQUESTED\]\n\nMust fix:\n- Empty fields are kept[^\n]*$/, "the advisor gets its answer back to show the user, with nothing after it");
+assert.match(advised, /^\[PEER-BRIDGE\] Your user's own standing rules[\s\S]*Never commit without asking me\./, "the user's rules come with the tool result, before the answer");
+assert.doesNotMatch(req, /Never commit without asking me/, "the rules never travel inside a peer message");
+assert.match(await receiveUntil(claude, undefined, /kind=advisory/), /Empty fields are kept[\s\S]*Never commit without asking me\./);
 console.log("4 concern delivered to the Claude primary; the advisor is told to show it in its chat");
 
 // 5. one-off review from Claude, reviewer joins from ChatGPT, answer comes back, link closes
@@ -149,7 +153,7 @@ assert.doesNotMatch(planReq, /Uncommitted changes/, "a plan review attaches no d
 await call(openai, "bridge_advise", { request_id: planReq.match(/Plan review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "Tests first." }] }, asGpt("gpt-thread-planner"));
 const planRes = await receiveUntil(claude, undefined, /kind=review-result plan/);
 assert.match(planRes, /Tests first\./);
-assert.match(planRes, /wait for the user's explicit approval in this chat before implementing anything\.$/);
+assert.match(planRes, /wait for the user's explicit approval in this chat before implementing anything\.\n\n\[PEER-BRIDGE\] Your user's own standing rules/, "the gate, then the user's rules");
 console.log(`5a2 plan review ${planRev.id}: no diff, plan guidance sent, requester told to wait for the user's approval`);
 
 // 5a3. a plan result read together with a review request (this chat is also
