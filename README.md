@@ -5,7 +5,7 @@ Let **Claude Code** (the Code tab of Claude Desktop) and **ChatGPT Desktop** che
 - **Advisor:** a chat in one app reviews every turn of a primary chat in the other.
 - **One-off review:** ask a chat in the other app once, optionally in a brand-new ChatGPT thread with a model you pick.
 
-> **Status: alpha.** It works end to end on Windows, in both directions, in the author's setup. macOS support is designed in but has not been verified on a Mac yet.
+> **Status: alpha.** It works end to end on Windows, in both directions, in the author's setup. On macOS, Claude Code reviewed by ChatGPT (advisor links and one-off reviews) works; the other direction hasn't been tried on a Mac yet.
 >
 > The ChatGPT side relies on undocumented parts of the app: its bundled `codex app-server` experimental API and the `codex://threads/wake` deep link. Any app update can break these.
 >
@@ -113,7 +113,7 @@ Each problem comes with the fix.
 - A Claude Code session can only be woken while it is open in Claude Desktop. Reviews for a closed advisor session wait until it opens, and the primary is told.
 - The Claude listener stops after 12 hours without activity. It re-arms with the next turn of that session.
 - Advisor and reviewer threads that the bridge creates in ChatGPT run read-only. A chat that joins with a code keeps its own permissions; it is only told not to act on the project.
-- macOS paths (the bundled `codex` and `claude` CLIs, `open -g` for deep links) haven't been verified on a Mac.
+- On macOS, ChatGPT as the primary with a Claude advisor hasn't been verified yet.
 
 ## Tests
 
