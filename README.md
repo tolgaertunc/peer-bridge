@@ -53,7 +53,7 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 
 | Mode | `[CHANGES REQUESTED]` | `[APPROVED]` |
 |---|---|---|
-| Advisor | The primary is woken, and its next turn is reviewed again. | Nits wait for the user's next prompt; without nits nothing is sent. |
+| Advisor | The primary is woken, and its next turn is reviewed again. | Nits wait for the user's next prompt. Without nits nothing is sent, unless the approval answers an earlier `[CHANGES REQUESTED]`: then it comes with the next prompt too, so the fix loop is seen to end. |
 | One-off review | The answer goes back; the primary asks for the next round with `bridge_review(round_of=…)`: same reviewer, same kind, "Round N" in the request. | The answer goes back; the review is done. |
 
 An emergency cap stops two agents looping: after 20 rounds in a row without approval (`PEER_BRIDGE_MAX_ROUNDS`), a review can't be continued, and an advisor's primary is told once to stop and ask the user and isn't reviewed again until the user writes. In advisor mode a new user prompt starts the count over. An answer to a turn from before it no longer steers the loop: it doesn't wake the primary or count as a round, but it comes once with the user's next prompt, marked as about an earlier turn (a plain approval stays silent). Repeated nits are dropped.

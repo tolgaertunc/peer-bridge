@@ -116,7 +116,7 @@ assert.ok(dup.dup);
 r = await runHook("claude", "prompt", { session_id: CLAUDE.id, prompt: "next" });
 const ctx = JSON.parse(r.out).hookSpecificOutput;
 assert.equal(ctx.hookEventName, "UserPromptSubmit");
-assert.match(ctx.additionalContext, /Name the test after the bug/);
+assert.match(ctx.additionalContext, /Your advisor approved the fix: the earlier \[CHANGES REQUESTED\] is resolved\.[\s\S]*Name the test after the bug/, "it closed the loop from step 3");
 await until(() => state().notes.every((n) => n.deliveredAt));
 r = await runHook("claude", "prompt", { session_id: CLAUDE.id, prompt: "again" });
 assert.equal(r.out, "");
@@ -645,6 +645,29 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   await until(() => state().messages.find((m) => m.id === req.id).readAt);
   await call("link_close", { linkId: l.id });
   console.log(`28 a long wake (${r.err.length} characters) arrives whole, then counts as read`);
+}
+
+// 29. advisor mode: a plain approval that answers [CHANGES REQUESTED] comes
+// with the next prompt (the fix loop is over), without waking anyone; a
+// routine plain approval stays silent
+{
+  const P = { app: "claude", id: "claude-loop-done" };
+  const A = { app: "openai", id: "gpt-loop-done" };
+  const l = await call("link_create", { primary: P, advisor: A });
+  const review = async (turn) => {
+    await call("turn_end", { endpoint: P, turnId: turn, lastMessage: `Turn ${turn}.` });
+    return state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id && m.text.includes(`Turn ${turn}.`)).id;
+  };
+  await call("advise", { endpoint: A, requestId: await review("t1"), decision: "changes_requested", blocking: [{ title: "Off by one" }] });
+  const woke = state().messages.filter((m) => sameTo(m.toEndpoint, P)).length;
+  const done = await call("advise", { endpoint: A, requestId: await review("t2"), decision: "approved", note: "Fixed." });
+  assert.equal(done.delivered, "next prompt");
+  assert.equal(state().messages.filter((m) => sameTo(m.toEndpoint, P)).length, woke, "nothing wakes the primary");
+  r = await runHook("claude", "prompt", { session_id: P.id, prompt: "next" });
+  assert.match(JSON.parse(r.out).hookSpecificOutput.additionalContext, /Your advisor approved the fix: the earlier \[CHANGES REQUESTED\] is resolved\.\n\n\[APPROVED\]\n\nFixed\./);
+  assert.equal((await call("advise", { endpoint: A, requestId: await review("t3"), decision: "approved" })).delivered, "none", "a routine approval stays silent");
+  await call("link_close", { linkId: l.id });
+  console.log("29 advisor: the approval that ends a fix loop comes with the next prompt; routine approvals stay silent");
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));

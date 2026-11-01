@@ -134,6 +134,9 @@ export function nextStep(m) {
   return `It is a message, not a review request: if it needs a reply, send one with bridge_send and reply_to "${m.id}" (not bridge_advise).`;
 }
 
+// Heads an approval that answers an earlier [CHANGES REQUESTED]
+export const LOOP_DONE_NOTE = "Your advisor approved the fix: the earlier [CHANGES REQUESTED] is resolved.";
+
 // Heads an advisor's answer that arrived after the user had moved on
 export const LATE_NOTE =
   "On an earlier turn, before your latest prompt. For information: act on it only if it still applies to what you are doing now.";
@@ -558,10 +561,15 @@ class BrokerState {
     }
     if (decision === "approved") {
       link.rounds = 0;
-      if (!nits.length) return { delivered: "none", text };
+      // an approval after [CHANGES REQUESTED] is the answer the fix loop was
+      // waiting for: it comes with the next prompt, without waking anyone.
+      // A routine approval of a turn that had nothing to fix stays silent.
+      const endsLoop = link.advisories.at(-2)?.decision === "changes_requested";
+      if (!nits.length && !endsLoop) return { delivered: "none", text };
       // the same nits again aren't news
-      if (link.advisories.slice(0, -1).some((a) => a.decision === "approved" && a.text === text)) return { delivered: "none", dup: true, text };
-      this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to: link.primary, kind: "advice", text, at: Date.now(), deliveredAt: null });
+      if (!endsLoop && link.advisories.slice(0, -1).some((a) => a.decision === "approved" && a.text === text)) return { delivered: "none", dup: true, text };
+      const note = endsLoop ? `${LOOP_DONE_NOTE}\n\n${text}` : text;
+      this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to: link.primary, kind: "advice", text: note, at: Date.now(), deliveredAt: null });
       return { delivered: "next prompt", text };
     }
     if (link.stopped) return { delivered: "none", stopped: true, text };
