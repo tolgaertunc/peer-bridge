@@ -92,8 +92,10 @@ const adv = await call("advise", { endpoint: GPT, requestId: req.id, decision: "
 assert.equal(adv.delivered, "now");
 r = await listener;
 assert.equal(r.code, 2, "listener must exit 2 to wake Claude");
-assert.match(r.err, /flagged your last turn/);
-console.log(`3 concern → Claude listener exited 2: ${r.err.split("\n")[0].slice(0, 90)}…`);
+assert.match(r.err, /flagged your last turn[\s\S]*\[CHANGES REQUESTED\][\s\S]*Parser drops the last token\./, "the Claude session is woken with the advice in full");
+await until(() => state().messages.find((m) => m.id === adv.id).readAt);
+assert.match((await call("receive", { side: "claude", endpoint: CLAUDE, id: adv.id })).messages[0].text, /Parser drops the last token/, "readable again by id");
+console.log(`3 concern → Claude listener exited 2 with the advice in full:${r.err.split("\n")[0].slice(0, 90)}…`);
 
 // 4. the fix loop: the turn after an advisory is reviewed again
 const before = state().messages.length;
@@ -114,7 +116,7 @@ assert.ok(dup.dup);
 r = await runHook("claude", "prompt", { session_id: CLAUDE.id, prompt: "next" });
 const ctx = JSON.parse(r.out).hookSpecificOutput;
 assert.equal(ctx.hookEventName, "UserPromptSubmit");
-assert.match(ctx.additionalContext, /Name the test after the bug/);
+assert.match(ctx.additionalContext, /Your advisor approved the fix: the earlier \[CHANGES REQUESTED\] is resolved\.[\s\S]*Name the test after the bug/, "it closed the loop from step 3");
 await until(() => state().notes.every((n) => n.deliveredAt));
 r = await runHook("claude", "prompt", { session_id: CLAUDE.id, prompt: "again" });
 assert.equal(r.out, "");
@@ -132,7 +134,7 @@ r = await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t9", last_as
 assert.equal(r.out, "");
 r = await advisorListener;
 assert.equal(r.code, 2);
-assert.match(r.err, /Review request/);
+assert.match(r.err, /Review request[\s\S]*User's message:\nWrite a reversible migration\./, "the Claude advisor is woken with the request in full");
 const gptReq = await until(() => state().messages.find((m) => m.kind === "review-request" && m.linkId === l2.id));
 assert.match(gptReq.text, /User's message:\nWrite a reversible migration\./);
 await call("advise", { endpoint: CLAUDE2, requestId: gptReq.id, decision: "changes_requested", blocking: [{ title: "Migration is not reversible." }] });
@@ -183,7 +185,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   await call("advise", { endpoint: REV, requestId: got.messages[0].id, decision: "approved" });
   r = await requester;
   assert.equal(r.code, 2);
-  assert.match(r.err, /review you asked for is ready/);
+  assert.match(r.err, /The review you asked for/);
   assert.equal(state().links[rl.id].active, false);
   console.log("10 one-off review: answer woke the requester, link closed (also when simply approved)");
 }
@@ -432,9 +434,37 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   await prompt("u3", "Actually, do something else.");
   await until(() => state().links[l.id].generation > pending.generation);
   const late = await call("advise", { endpoint: A, requestId: pending.id, decision: "changes_requested", blocking: [{ title: "old" }] });
-  assert.ok(late.stale && late.delivered === "none", "an answer from before the user's latest prompt doesn't steer");
+  assert.ok(late.stale && late.delivered === "next prompt", "an answer from before the user's latest prompt doesn't steer, but isn't lost");
+  assert.equal(state().links[l.id].rounds, 0, "nor does it count as a round");
+  // it comes once, with the next prompt, marked as about an older turn
+  r = await prompt("u4", "Next.");
+  assert.match(JSON.parse(r.out).hookSpecificOutput.additionalContext, /On an earlier turn, before your latest prompt\. For information[^\n]*\n\n\[CHANGES REQUESTED\][\s\S]*- old/);
+  await until(() => state().notes.filter((n) => n.linkId === l.id).every((n) => n.deliveredAt));
+  r = await prompt("u5", "Again.");
+  assert.doesNotMatch(r.out, /On an earlier turn/, "delivered once");
+  // the same late answer again isn't noted twice; a late plain approval stays
+  // silent unless it closes a fix loop (the user wrote while the fix was
+  // being reviewed); one with nits is noted
+  const lateAnswer = async (turn, answer) => {
+    await stopTurn(turn);
+    const req = await openReq();
+    await prompt(`${turn}-next`, "Moving on.");
+    await until(() => state().links[l.id].generation > req.generation);
+    return call("advise", { endpoint: A, requestId: req.id, ...answer });
+  };
+  const again = await lateAnswer("u6", { decision: "changes_requested", blocking: [{ title: "old" }] });
+  assert.ok(again.dup && again.delivered === "none");
+  assert.equal((await lateAnswer("u7", { decision: "approved", note: "Fix confirmed." })).delivered, "next prompt", "a late approval of the fix still closes the loop");
+  await until(() => state().notes.some((n) => n.linkId === l.id && /Fix confirmed/.test(n.text)));
+  r = await prompt("u7-see", "And now?");
+  assert.match(
+    JSON.parse(r.out).hookSpecificOutput.additionalContext,
+    /On an earlier turn, before your latest prompt\.[^\n]*\n\nYour advisor approved the fix: the earlier \[CHANGES REQUESTED\] is resolved\.\n\n\[APPROVED\]\n\nFix confirmed\./,
+  );
+  assert.equal((await lateAnswer("u7b", { decision: "approved" })).delivered, "none", "a routine late approval stays silent");
+  assert.equal((await lateAnswer("u8", { decision: "approved", nits: [{ title: "rename" }] })).delivered, "next prompt");
   delete process.env.PEER_BRIDGE_MAX_ROUNDS;
-  console.log("21 advisor loop: bridge prompts don't reset, user prompts do; stop at the cap, no reviews until the user writes; stale answers ignored");
+  console.log("21 advisor loop: bridge prompts don't reset, user prompts do; stop at the cap, no reviews until the user writes; late answers come once as a note");
 }
 
 // 22. telling the bridge's prompts from the user's: exact text, once per
@@ -586,6 +616,131 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   await call("link_close", { linkId: a.id });
   await assert.rejects(call("send", { endpoint: S, text: "hi", linkId: a.id }), /no longer open for this chat; try again/);
   console.log("26 bridge_send: to the checked link, not a newer one; refused if it closed meanwhile");
+}
+
+// 27. a bridge prompt that comes back slightly changed (CRLF line ends, a
+// trailing newline) still counts as the bridge's, so the round cap holds; a
+// header alone is still the user's
+{
+  const P = { app: "openai", id: "gpt-crlf" };
+  const A = { app: "claude", id: "claude-crlf-advisor" };
+  const l = await call("link_create", { primary: P, advisor: A });
+  await call("turn_start", { endpoint: P, turnId: "u1", prompt: "Go." });
+  await call("turn_end", { endpoint: P, turnId: "u1", lastMessage: "done" });
+  const req = state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id);
+  const adv = await call("advise", { endpoint: A, requestId: req.id, decision: "changes_requested", blocking: [{ title: "no" }] });
+  const delivered = inlineText(state().messages.find((m) => m.id === adv.id));
+  assert.ok(!(await call("turn_start", { endpoint: P, turnId: "u2", prompt: delivered.split("\n")[0] })).fromBridge, "a header alone is the user's");
+  assert.ok((await call("turn_start", { endpoint: P, turnId: "b1", prompt: delivered.replace(/\n/g, "\r\n") + "\r\n" })).fromBridge, "changed line ends: still the bridge's");
+  await call("link_close", { linkId: l.id });
+  console.log("27 a bridge prompt with changed line ends still counts as the bridge's; a header alone doesn't");
+}
+
+// 28. a long wake reaches the Claude session whole, down to its final
+// instruction line, and only then counts as read
+{
+  const G = { app: "openai", id: "gpt-long" };
+  const C = { app: "claude", id: "claude-long-advisor" };
+  const l = await call("link_create", { primary: G, advisor: C });
+  const listener = runHook("claude", "listen", { session_id: C.id });
+  await sleep(1200);
+  await call("turn_end", { endpoint: G, turnId: "big", lastMessage: "a".repeat(9_000), diff: `diff --git a/x b/x\n${"+line of the diff\n".repeat(1_100)}` });
+  const req = state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id);
+  r = await listener;
+  assert.equal(r.code, 2);
+  assert.ok(r.err.length > 25_000, `the whole wake arrived (${r.err.length} characters)`);
+  assert.ok(r.err.trimEnd().endsWith(`answer once with bridge_advise (request_id ${req.id}).`), "down to its last line");
+  await until(() => state().messages.find((m) => m.id === req.id).readAt);
+  await call("link_close", { linkId: l.id });
+  console.log(`28 a long wake (${r.err.length} characters) arrives whole, then counts as read`);
+}
+
+// 29. advisor mode: a plain approval that answers [CHANGES REQUESTED] comes
+// with the next prompt (the fix loop is over), without waking anyone; a
+// routine plain approval stays silent
+{
+  const P = { app: "claude", id: "claude-loop-done" };
+  const A = { app: "openai", id: "gpt-loop-done" };
+  const l = await call("link_create", { primary: P, advisor: A });
+  const review = async (turn) => {
+    await call("turn_end", { endpoint: P, turnId: turn, lastMessage: `Turn ${turn}.` });
+    return state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id && m.text.includes(`Turn ${turn}.`)).id;
+  };
+  await call("advise", { endpoint: A, requestId: await review("t1"), decision: "changes_requested", blocking: [{ title: "Off by one" }] });
+  const woke = state().messages.filter((m) => sameTo(m.toEndpoint, P)).length;
+  const done = await call("advise", { endpoint: A, requestId: await review("t2"), decision: "approved", note: "Fixed." });
+  assert.equal(done.delivered, "next prompt");
+  assert.equal(state().messages.filter((m) => sameTo(m.toEndpoint, P)).length, woke, "nothing wakes the primary");
+  r = await runHook("claude", "prompt", { session_id: P.id, prompt: "next" });
+  assert.match(JSON.parse(r.out).hookSpecificOutput.additionalContext, /Your advisor approved the fix: the earlier \[CHANGES REQUESTED\] is resolved\.\n\n\[APPROVED\]\n\nFixed\./);
+  assert.equal((await call("advise", { endpoint: A, requestId: await review("t3"), decision: "approved" })).delivered, "none", "a routine approval stays silent");
+  await call("link_close", { linkId: l.id });
+  console.log("29 advisor: the approval that ends a fix loop comes with the next prompt; routine approvals stay silent");
+}
+
+// 30. one turn, many prompt hooks: Claude Code runs UserPromptSubmit with the
+// running turn's prompt_id for a message typed mid-turn and for its own
+// background-task notice (measured). They keep the turn's task and baseline
+// and don't start a generation; the user's message is added to the task.
+// Only equal, present ids count as one turn.
+{
+  const { turnFile } = await import("../src/broker.mjs");
+  const P = { app: "claude", id: "claude-mid-turn" };
+  const l = await call("link_create", { primary: P, advisor: { app: "openai", id: "gpt-mid-turn" } });
+  const link = () => state().links[l.id];
+  const prompt = async (prompt_id, text) => {
+    const n = fs.readdirSync(path.join(dir, "outbox")).length;
+    await runHook("claude", "prompt", { session_id: P.id, prompt: text, ...(prompt_id && { prompt_id }) });
+    await until(() => fs.readdirSync(path.join(dir, "outbox")).length <= n); // processed
+  };
+  const base = () => JSON.parse(fs.readFileSync(turnFile(P), "utf8"));
+  const review = async (prompt_id, answer) => {
+    await runHook("claude", "stop", { session_id: P.id, last_assistant_message: answer, ...(prompt_id && { prompt_id }) });
+    return (await until(() => state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id && m.text.includes(answer)))).text;
+  };
+  const notice = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>";
+
+  await prompt("t1", "Build the importer.");
+  const g = link().generation;
+  const b1 = base();
+  assert.equal(b1.turnId, "t1");
+  await prompt("t1", notice);
+  await prompt("t1", "Be quick.");
+  await prompt("t1", notice);
+  assert.equal(link().generation, g, "mid-turn messages and notices start no generation");
+  assert.deepEqual(base(), b1, "the turn's baseline is kept");
+  let text = await review("t1", "Importer built.");
+  assert.match(text, /User's message:\nBuild the importer\.\n\nAdded by the user while the turn was running:\nBe quick\.\n\nPrimary's final message/);
+  assert.ok(!text.includes("task-notification"), "the app's notices aren't the user's");
+
+  // a turn the app's notice starts (idle session) isn't the user's either
+  await prompt("t2", notice);
+  assert.equal(link().generation, g, "a notice starts no generation");
+  text = await review("t2", "Noted the task.");
+  assert.match(text, /User's message:\n\(None: the app started this turn/);
+
+  // an interrupted turn (no Stop) followed by a new task: the new id gets a
+  // new baseline and only its own message
+  await prompt("t3", "Task A.");
+  const b3 = base();
+  await prompt("t4", "Task B.");
+  assert.equal(base().turnId, "t4");
+  assert.ok(base().at >= b3.at);
+  assert.equal(link().generation, g + 2);
+  text = await review("t4", "Did B.");
+  assert.match(text, /User's message:\nTask B\.\n\nPrimary's final message/);
+
+  // without ids every prompt is a new turn, as before
+  await prompt(null, "First.");
+  const b5 = base();
+  await sleep(5);
+  await prompt(null, "Second.");
+  assert.notDeepEqual(base(), b5, "no id: new baseline");
+  assert.equal(link().generation, g + 4);
+  text = await review(null, "Did both.");
+  assert.match(text, /User's message:\nSecond\.\n\nPrimary's final message/);
+  await call("link_close", { linkId: l.id });
+  console.log("30 mid-turn: messages typed during a turn join its task, notices are ignored, the baseline holds; new or missing ids start a turn");
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));

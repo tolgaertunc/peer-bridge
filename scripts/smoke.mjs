@@ -109,7 +109,7 @@ assert.match(req, /\+export const parse = \(s\) => s\.split\(','\)\.map\(\(x\) =
 assert.match(req, /New untracked files:\nnotes\.md/);
 assert.doesNotMatch(req, /super-secret|\.env|secrets\//, "secret files must never be sent, not even by name");
 const reqId = req.match(/Review request (m\d+)/)[1];
-assert.equal(textOf(await call(openai, "bridge_receive", {}, asGpt(THREAD))), "No unread peer messages.", "a delivered message isn't handed out again");
+assert.match(textOf(await call(openai, "bridge_receive", {}, asGpt(THREAD))), /^No unread peer messages\./, "a delivered message isn't handed out again");
 console.log("3 review request shown in full in the ChatGPT thread: question, answer, turn's diff; .env, .envrc, secrets/ left out");
 
 // 4. advisor raises a concern → Claude gets it
@@ -198,12 +198,23 @@ console.log(`5a4 round 2 (${round2.id}) of plan review ${planRev.id}: same revie
 await call(claude, "bridge_send", { text: "Heads up: I'm also changing the tokenizer." });
 const plain = await deliveredTo(THREAD, /changing the tokenizer/);
 assert.match(plain, /^CLAUDE: Message (m\d+)/);
-assert.match(plain, /not a review request: if it needs a reply, send one with bridge_send \(not bridge_advise\)/);
-const wrongTool = await openai.callTool({ name: "bridge_advise", arguments: { request_id: plain.match(/Message (m\d+)/)[1], decision: "approved" }, _meta: asGpt(THREAD) });
+const plainId = plain.match(/Message (m\d+)/)[1];
+assert.match(plain, new RegExp(`not a review request: if it needs a reply, send one with bridge_send and reply_to "${plainId}" \\(not bridge_advise\\)`));
+const wrongTool = await openai.callTool({ name: "bridge_advise", arguments: { request_id: plainId, decision: "approved" }, _meta: asGpt(THREAD) });
 assert.ok(wrongTool.isError && /is a message, not a review request; reply to it with bridge_send/.test(textOf(wrongTool)), textOf(wrongTool));
+// a reply goes to the chat that sent the message, even when the replying
+// chat's latest link is another one
+const other = (await call(claude, "bridge_review", { reviewer: "join", request: "Another review." }, undefined)).structuredContent;
+await call(openai, "bridge_link_join", { code: other.joinCode }, asGpt(THREAD));
+// the Claude session is listening, so the bridge doesn't stop to ask about opening it
+fs.writeFileSync(path.join(dir, "listeners", `claude-${SESSION}.json`), JSON.stringify({ pid: 1, beat: Date.now() }));
+await call(openai, "bridge_send", { text: "Tokenizer change noted.", reply_to: plainId }, asGpt(THREAD));
+assert.match(await receiveUntil(claude, undefined, /Tokenizer change noted\./), new RegExp(`link=${link.id}`), "the reply stays on the message's own link");
+const badReply = await openai.callTool({ name: "bridge_send", arguments: { text: "x", reply_to: "m99999" }, _meta: asGpt(THREAD) });
+assert.ok(badReply.isError && /no message m99999 for this chat/.test(textOf(badReply)));
 const lonely = await openai.callTool({ name: "bridge_send", arguments: { text: "hello?" }, _meta: asGpt("gpt-thread-unlinked") });
 assert.ok(lonely.isError && /no active link/.test(textOf(lonely)));
-console.log("5b bridge_send reaches the linked chat, bridge_advise on it points to bridge_send; refused without a link");
+console.log("5b bridge_send reaches the linked chat, bridge_advise on it points to bridge_send, reply_to answers on the message's own link; refused without a link");
 
 // 5c. a review asked from the ChatGPT side never attaches some other project's changes
 const gptRev = (await call(openai, "bridge_review", { reviewer: "join", request: "Sanity-check my plan." }, asGpt(THREAD))).structuredContent;

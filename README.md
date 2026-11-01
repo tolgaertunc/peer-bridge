@@ -77,7 +77,7 @@ You talk to your agent as usual and ask it to use the bridge; it calls the bridg
 - *"Use the same ChatGPT chat as last time."* The review continues in that chat, with its earlier context.
 - *"Stop the reviews."* The link is closed.
 
-You can pick the model and reasoning effort of a new ChatGPT chat ("…with gpt-6.1-sol, high effort").
+You can pick the model and reasoning effort of a new ChatGPT chat ("…with gpt-6.1-sol, high effort"). The bridge checks the name against the models your ChatGPT Desktop offers; an unknown one is refused with the list, and nothing is created.
 
 From ChatGPT, or to use an existing chat of either app as the reviewer, ask for a **join code** and paste it into the other chat: *"join the peer-bridge link with code 3fa9c1"*.
 
@@ -104,7 +104,7 @@ An approval with must-fix items, or a rejection without any, is refused, so the 
 **The fix loop.** After `[CHANGES REQUESTED]` the bridge tells the requesting agent, in its own fixed words: fix what holds up, say why when a finding is wrong, ask again, and stop and ask you when going in circles. The reviewer is told to answer each objection. Nits never block approval.
 
 - **One-off review:** the agent asks for the next round of the same review (*Round 2 of review L7*). It goes to the same reviewer with the same kind (a plan review stays one).
-- **Advisor:** the agent's next turn is reviewed again. A new message from you starts the count over.
+- **Advisor:** the agent's next turn is reviewed again. A new message from you starts the count over. When an approval ends a fix loop, it comes with your next message, so you see the loop end; routine approvals stay silent. An answer about a turn from before your latest message no longer steers the loop, but it comes once with your next message, marked as being about an earlier turn.
 
 **Emergency stop.** If two agents go 20 rounds in a row without approval, the loop stops and the agent is told to ask you (`PEER_BRIDGE_MAX_ROUNDS` changes the number).
 
@@ -162,7 +162,7 @@ Other settings, read by the bridge's processes: `PEER_BRIDGE_CLAUDE_BIN` (Claude
 
 - A Claude Code session can only be woken while it is open in Claude Desktop; messages for a closed one wait until it opens.
 - A Claude session's listener runs for up to 12 hours at a time; each turn or session start arms it again.
-- A ChatGPT thread runs the bridge's messages as prompts, and the bridge recognises its own by their exact text. If you paste one verbatim before the bridge's own turn for it runs, only the fix-loop count restarts.
+- A ChatGPT thread runs the bridge's messages as prompts, and the bridge recognises its own by their text (if the app changes line endings or spacing, the message's first line and its fixed last line still identify it). If you paste one verbatim before the bridge's own turn for it runs, only the fix-loop count restarts.
 - On macOS, ChatGPT as the primary with a Claude advisor hasn't been verified yet.
 - CLIs: the Claude Code CLI should work, since it reads the same MCP server and hooks, but it hasn't been tested. The bridge can only reopen closed sessions that run in Claude Desktop; a CLI session has to be resumed by hand. The Codex CLI isn't supported: messages for the ChatGPT side wake ChatGPT Desktop, not a terminal session.
 
@@ -178,12 +178,14 @@ The bridge's MCP tools, for agents. You normally don't call them yourself.
 | `bridge_link` | Make this chat a primary whose every turn is reviewed. `advisor`: `"openai"` (from Claude) or `"join"`. |
 | `bridge_link_join` | Become the advisor or reviewer of a link, with its code. |
 | `bridge_advise` | Answer a review request: `request_id`, `decision` (`"approved"` or `"changes_requested"`), `note`, `blocking`, `nits`. |
-| `bridge_receive` | Read incoming messages (Claude is woken with a notice and reads them here). |
-| `bridge_send` | Send a free-form message to the chat on the other end of this chat's latest link. |
+| `bridge_receive` | Read messages that are still unread, or one again by `id`. Messages normally arrive in full without it. |
+| `bridge_send` | Send a free-form message to the chat on the other end of this chat's latest link. With `reply_to` (a message id) the answer goes to that message's sender, on its own link. |
 | `bridge_status` | This chat's links, their health, and whether Claude sessions are listening. |
 | `bridge_unlink` | Close this chat's links. |
 
 `bridge_review`, `bridge_link` and `bridge_send` also take `open` and `remember`, used only after the user agreed to open a closed app.
+
+**Models.** A new ChatGPT thread's `model` must be one your ChatGPT Desktop offers. The bridge checks it against the app's live model list first: the id (`gpt-6-astra`) or the name the picker shows (`GPT-6-Astra`) both work. An unknown model, or an `effort` the model doesn't support, is refused with the list, and nothing is created; the agent then picks one, or asks you. If the app version can't list its models, nothing is checked; if the list can't be read for another reason, nothing is created. On the Claude side the bridge never picks a model: a Claude chat joins with a code and keeps its own.
 
 ## How it works
 
@@ -195,9 +197,10 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 ```
 
 - **Hooks.** When a turn starts, a `UserPromptSubmit` hook records the question and snapshots the working tree (`git stash create`, which touches no files or refs). When it ends, a `Stop` hook queues the question, the final answer and the turn's diff for review. Hooks never wait for the reviewer and never use the network.
+- **Messages typed mid-turn.** Claude Code runs the prompt hook again, with the running turn's id, for a message you type while it works and for its own notices. These stay part of the running turn: the task and the diff baseline are kept, your message is added to the task, notices are left out, and none of them restarts the fix-loop count. A prompt without an id always starts a new turn.
 - **Broker.** A small local store shared by both apps' MCP servers: HTTP on `127.0.0.1` with a token, plus a state file. Hooks read the state file and drop requests into an outbox folder. The broker keeps the names of the requests it has applied, so a takeover doesn't apply one twice. If the process holding the broker exits, another server takes over within about 2 seconds.
 - **Waking ChatGPT.** The whole message is added to the thread's own queue through the app's bundled `codex app-server`, then `codex://threads/wake/<id>` makes the app run it, in the background if needed.
-- **Waking Claude Code.** A background hook (`asyncRewake`) waits for messages for its session and wakes it with a short notice; the session then reads the message with `bridge_receive`. It re-arms on every turn and session start.
+- **Waking Claude Code.** A background hook (`asyncRewake`) waits for messages for its session and wakes it with the whole message, in the same format a ChatGPT thread gets. It re-arms on every turn and session start. If a wake ever looks cut off, `bridge_receive` with the message's id returns it in full.
 - **Identity.** The bridge learns which chat is calling from the host, never from the model's memory: `CLAUDE_CODE_SESSION_ID` on the Claude side, `_meta.threadId` on the ChatGPT side. Context compaction can't break a link.
 - **Problems are visible.** A failed delivery or a Claude session that isn't listening shows up in the waiting chat's next prompt and in `bridge_status`.
 
@@ -210,6 +213,7 @@ npm test
 | Test | Covers |
 |---|---|
 | `scripts/test-git.mjs` | Turn diffs: secret exclusion, repos without commits, untracked edits, size cap. |
+| `scripts/test-codex.mjs` | Model choice for new ChatGPT threads: ids, picker names, unknown models and efforts refused. |
 | `scripts/test-platform.mjs` | Finding the apps' bundled CLIs. |
 | `scripts/smoke.mjs` | End to end over MCP: two real server processes, the hooks, a throwaway git repo. |
 | `scripts/test-link.mjs` | Links, reviews and rounds, the fix loop, hooks, rules, pruning, broker handover. |
