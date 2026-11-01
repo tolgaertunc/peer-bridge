@@ -87,6 +87,7 @@ A new ChatGPT thread's `model` must be one that your ChatGPT Desktop offers. Bef
 - An `effort` the chosen model doesn't support is refused the same way.
 - An effort given without a model isn't checked.
 - If the app version can't list its models, nothing is checked.
+- If the list can't be read for any other reason, nothing is created.
 
 On the Claude side the bridge never picks a model: a Claude chat only joins with a code, and it keeps the model it already has.
 
