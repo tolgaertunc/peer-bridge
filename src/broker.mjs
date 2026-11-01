@@ -552,19 +552,20 @@ class BrokerState {
     // an answer to a request from before the user's latest prompt no longer
     // steers the primary (no wake, no round), but isn't lost either: it comes
     // with the user's next prompt, marked as information about an older turn
+    // an approval after [CHANGES REQUESTED] is the answer the fix loop was
+    // waiting for: it comes with the next prompt (late or not), without
+    // waking anyone. A routine approval of a turn that had nothing to fix
+    // stays silent.
+    const endsLoop = decision === "approved" && link.advisories.at(-2)?.decision === "changes_requested";
     if ((req.generation ?? 0) !== (link.generation ?? 0)) {
-      if (decision === "approved" && !nits.length) return { delivered: "none", stale: true, text };
-      const late = `${LATE_NOTE}\n\n${text}`;
+      if (decision === "approved" && !nits.length && !endsLoop) return { delivered: "none", stale: true, text };
+      const late = `${LATE_NOTE}\n\n${endsLoop ? `${LOOP_DONE_NOTE}\n\n` : ""}${text}`;
       if (this.s.notes.some((n) => n.linkId === link.id && n.text === late)) return { delivered: "none", stale: true, dup: true, text };
       this.s.notes.push({ id: "n" + ++this.s.seq, linkId: link.id, to: link.primary, kind: "advice", text: late, at: Date.now(), deliveredAt: null });
       return { delivered: "next prompt", stale: true, text };
     }
     if (decision === "approved") {
       link.rounds = 0;
-      // an approval after [CHANGES REQUESTED] is the answer the fix loop was
-      // waiting for: it comes with the next prompt, without waking anyone.
-      // A routine approval of a turn that had nothing to fix stays silent.
-      const endsLoop = link.advisories.at(-2)?.decision === "changes_requested";
       if (!nits.length && !endsLoop) return { delivered: "none", text };
       // the same nits again aren't news
       if (!endsLoop && link.advisories.slice(0, -1).some((a) => a.decision === "approved" && a.text === text)) return { delivered: "none", dup: true, text };

@@ -443,7 +443,8 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   r = await prompt("u5", "Again.");
   assert.doesNotMatch(r.out, /On an earlier turn/, "delivered once");
   // the same late answer again isn't noted twice; a late plain approval stays
-  // silent, one with nits is noted
+  // silent unless it closes a fix loop (the user wrote while the fix was
+  // being reviewed); one with nits is noted
   const lateAnswer = async (turn, answer) => {
     await stopTurn(turn);
     const req = await openReq();
@@ -453,7 +454,14 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   };
   const again = await lateAnswer("u6", { decision: "changes_requested", blocking: [{ title: "old" }] });
   assert.ok(again.dup && again.delivered === "none");
-  assert.equal((await lateAnswer("u7", { decision: "approved" })).delivered, "none");
+  assert.equal((await lateAnswer("u7", { decision: "approved", note: "Fix confirmed." })).delivered, "next prompt", "a late approval of the fix still closes the loop");
+  await until(() => state().notes.some((n) => n.linkId === l.id && /Fix confirmed/.test(n.text)));
+  r = await prompt("u7-see", "And now?");
+  assert.match(
+    JSON.parse(r.out).hookSpecificOutput.additionalContext,
+    /On an earlier turn, before your latest prompt\.[^\n]*\n\nYour advisor approved the fix: the earlier \[CHANGES REQUESTED\] is resolved\.\n\n\[APPROVED\]\n\nFix confirmed\./,
+  );
+  assert.equal((await lateAnswer("u7b", { decision: "approved" })).delivered, "none", "a routine late approval stays silent");
   assert.equal((await lateAnswer("u8", { decision: "approved", nits: [{ title: "rename" }] })).delivered, "next prompt");
   delete process.env.PEER_BRIDGE_MAX_ROUNDS;
   console.log("21 advisor loop: bridge prompts don't reset, user prompts do; stop at the cap, no reviews until the user writes; late answers come once as a note");
