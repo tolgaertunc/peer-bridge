@@ -90,6 +90,19 @@ const OPEN_ARGS = {
   remember: z.boolean().optional().describe("With open=true: from now on open closed apps without asking; pass only if the user said so"),
 };
 
+const MODEL_CHOICE = "a model or effort ChatGPT doesn't offer is refused with the list of what it does";
+
+// A new ChatGPT thread, read-only: it reviews, it doesn't touch the project
+async function newThread({ model, effort, name, seed }) {
+  const { createThread, ModelChoiceError } = await import("./codex.mjs");
+  try {
+    return await createThread({ model, effort, name, seed, sandbox: "read-only" });
+  } catch (e) {
+    if (e instanceof ModelChoiceError) return { refused: e.message };
+    throw e;
+  }
+}
+
 const server = new McpServer({ name: "peer-bridge", version: "0.1.0" });
 
 server.registerTool(
@@ -163,12 +176,12 @@ server.registerTool(
     description:
       "Make this chat the primary of a peer-bridge link: after each of your turns, an advisor chat in the other app reviews it. " +
       (SIDE === "claude"
-        ? "advisor='openai' creates a new ChatGPT thread for it (optionally pick the model, e.g. gpt-6-luna) or binds an existing one (thread_id). "
+        ? `advisor='openai' creates a new ChatGPT thread for it (optionally pick the model and effort; ${MODEL_CHOICE}) or binds an existing one (thread_id). `
         : "") +
       "advisor='join' returns a code to paste into an existing chat of either app, which then calls bridge_link_join.",
     inputSchema: {
       advisor: z.enum(SIDE === "claude" ? ["openai", "join"] : ["join"]).describe("Where the advisor runs"),
-      model: z.string().optional().describe("Model for a new ChatGPT advisor thread"),
+      model: z.string().optional().describe("Model for a new ChatGPT advisor thread, as ChatGPT lists it (id or name)"),
       effort: z.string().optional().describe("Reasoning effort for a new ChatGPT advisor thread, e.g. low, medium, high"),
       thread_id: z.string().optional().describe("Existing ChatGPT thread to use as advisor"),
       name: z.string().optional().describe("Name for a new advisor thread"),
@@ -190,9 +203,9 @@ server.registerTool(
     if (stop) return stop;
     let threadId = thread_id;
     if (!threadId) {
-      const { createThread } = await import("./codex.mjs");
-      // read-only: the advisor reviews, it doesn't touch the project
-      threadId = (await createThread({ model, effort, name: name ?? "Peer bridge · Advisor", seed: ADVISOR_BRIEF, sandbox: "read-only" })).threadId;
+      const t = await newThread({ model, effort, name: name ?? "Peer bridge · Advisor", seed: ADVISOR_BRIEF });
+      if (t.refused) return text(t.refused);
+      threadId = t.threadId;
     }
     const r = await call("link_create", { primary, advisor: { app: "openai", id: threadId } });
     return withRules(
@@ -250,14 +263,14 @@ server.registerTool(
       "For a plan (before implementing), use kind='plan': no changes are attached unless include_diff is set, and once it's reviewed you show the user the plan and verdict and wait for their approval. " +
       "After [CHANGES REQUESTED], ask for the next round with round_of (the previous review's link id): same reviewer and kind, and say what you changed and where you disagree. " +
       (SIDE === "claude"
-        ? "reviewer='openai' opens a new ChatGPT thread for it (pick the model, e.g. gpt-6-luna), or continues in an earlier one (thread_id), which keeps that chat's context; "
+        ? `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context; `
         : "") +
       "reviewer='join' returns a code for an existing chat, which then calls bridge_link_join. The answer arrives as a new turn.",
     inputSchema: {
       request: z.string().describe("What to review and what you want to know"),
       reviewer: z.enum(SIDE === "claude" ? ["openai", "join"] : ["join"]).optional().describe("Where the reviewer runs (not needed with round_of)"),
       round_of: z.string().optional().describe("Link id of the previous round (e.g. L7) to ask the same reviewer for the next round"),
-      model: z.string().optional().describe("Model for a new ChatGPT reviewer thread"),
+      model: z.string().optional().describe("Model for a new ChatGPT reviewer thread, as ChatGPT lists it (id or name)"),
       effort: z.string().optional().describe("Reasoning effort for a new ChatGPT reviewer thread, e.g. low, medium, high"),
       kind: z.enum(["code", "plan"]).optional().describe("What is reviewed: code (default) or a plan before implementing it"),
       include_diff: z.boolean().optional().describe("Attach uncommitted changes (default true for code, false for a plan)"),
@@ -299,8 +312,10 @@ server.registerTool(
     if (stop) return stop;
     let threadId = thread_id;
     if (!threadId) {
-      const { createThread } = await import("./codex.mjs");
-      threadId = (await createThread({ model, effort, name: name ?? `Peer bridge · ${what}: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF, sandbox: "read-only" })).threadId;
+      const t = await newThread({ model, effort, name: name ?? `Peer bridge · ${what}: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF });
+      if (t.refused) return text(t.refused);
+      threadId = t.threadId;
+      model = t.model ?? model;
     }
     const r = await call("link_create", { primary, mode: "review", advisor: { app: "openai", id: threadId }, request: req, plan });
     const where = thread_id ? `ChatGPT thread ${threadId}` : `a new ChatGPT thread (${threadId}${model ? `, ${model}` : ""}${effort ? `, effort ${effort}` : ""})`;

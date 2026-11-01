@@ -80,12 +80,54 @@ async function withServer(fn, opts) {
   }
 }
 
+// The models this account can use, in the app's own order (hidden ones too, so
+// a name typed exactly still works); null when this app version can't list them
+async function listModels(s) {
+  try {
+    const models = [];
+    let cursor = null;
+    do {
+      const r = await s.rpc("model/list", { includeHidden: true, ...(cursor && { cursor }) });
+      models.push(...r.data);
+      cursor = r.nextCursor;
+    } while (cursor);
+    return models;
+  } catch {
+    return null;
+  }
+}
+
+export class ModelChoiceError extends Error {}
+
+const sameName = (a, b) => typeof a === "string" && a.trim().toLowerCase().replace(/\s+/g, "-") === b.trim().toLowerCase().replace(/\s+/g, "-");
+
+// The app's id for a chosen model (its id, or its display name as shown in the
+// picker), checked before a thread is made: thread/start takes any name, and
+// the thread then only says "This model isn't available". An effort the model
+// doesn't offer is refused the same way.
+export function pickModel(models, model, effort) {
+  if (!models || !model) return model;
+  const m = models.find((x) => [x.id, x.model, x.displayName].some((n) => sameName(n, model)));
+  if (!m) {
+    const names = models.filter((x) => !x.hidden).map((x) => `${x.model} (${x.displayName})`);
+    throw new ModelChoiceError(
+      `Nothing was created: ChatGPT has no model "${model}". Its models: ${names.join(", ")}. ` +
+        "Call again with one of these; if the user's choice isn't clearly one of them, ask the user.",
+    );
+  }
+  const efforts = (m.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort);
+  if (effort && efforts.length && !efforts.includes(effort))
+    throw new ModelChoiceError(`Nothing was created: ${m.model} has no effort "${effort}". Its efforts: ${efforts.join(", ")}.`);
+  return m.model;
+}
+
 // New named thread with a chosen model, without running a model turn
 // (`inject_items` is what makes a turn-less thread persist)
 // (`effort` is set both as a config override and as a thread setting, so it
 // holds whichever the desktop app picks up when it resumes the thread)
 export function createThread({ model, effort, cwd, name, seed, sandbox }, opts) {
   return withServer(async (s) => {
+    if (model) model = pickModel(await listModels(s), model, effort);
     const r = await s.rpc("thread/start", {
       model: model ?? null,
       cwd: cwd ?? process.cwd(),

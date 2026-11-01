@@ -69,7 +69,7 @@ An emergency cap stops two agents looping: after 20 rounds in a row without appr
 
 | Tool | Purpose |
 |---|---|
-| `bridge_link` | Make this chat a primary whose every turn is reviewed. From Claude, `advisor="openai"` creates a new ChatGPT advisor thread, running read-only, where you can pick the `model` and reasoning `effort`. `advisor="join"` returns a code that any existing chat can use. |
+| `bridge_link` | Make this chat a primary whose every turn is reviewed. From Claude, `advisor="openai"` creates a new ChatGPT advisor thread, running read-only, where you can pick the `model` and reasoning `effort` (see [Models](#models)). `advisor="join"` returns a code that any existing chat can use. |
 | `bridge_review` | Ask for a one-off review of a `request`. The chat's own uncommitted changes are attached; on the ChatGPT side they are attached only when the project folder is known. From Claude, `reviewer="openai"` opens a new ChatGPT thread (for example `model="gpt-6-luna"`, `effort="high"`), or continues in an earlier reviewer's thread with `thread_id`, keeping that chat's context. `reviewer="join"` returns a code. `kind="plan"` reviews a plan instead: no changes attached by default, and the requester waits for the user's approval before building it. `round_of` asks the same reviewer for the next round after `[CHANGES REQUESTED]`. The answer arrives as a new turn. |
 | `bridge_link_join` | Become the advisor or reviewer of a link, using its code. |
 | `bridge_advise` | The advisor's or reviewer's answer: `approved` or `changes_requested`, with must-fix items and nits apart. It names the request it answers (`request_id`, required), so a chat serving several links can't mix them up. A plain message isn't a review request: it is answered with `bridge_send` and `reply_to`. |
@@ -77,6 +77,18 @@ An emergency cap stops two agents looping: after 20 rounds in a row without appr
 | `bridge_status` | Show this chat's links, their health, whether Claude sides are listening, and pending notes. |
 | `bridge_send` | Send a free-form message to the chat on the other end of this chat's latest link, which is woken with it. With `reply_to` (a message id) the answer goes to that message's sender, on its own link. |
 | `bridge_receive` | Read messages still unread, or one by `id` again. Messages normally arrive in full without it. |
+
+### Models
+
+A new ChatGPT thread's `model` must be one that your ChatGPT Desktop offers. Before the thread is made, the bridge checks the name against the app's own live model list (`model/list` in its app-server):
+
+- Give the id (`gpt-6-astra`) or the name the model picker shows (`GPT-6-Astra`).
+- A model that isn't in the list is refused, with the list attached, and nothing is created. The agent then picks one from the list, or asks you if your choice isn't clearly one of them. Without this check, ChatGPT would make the thread anyway, and the thread would only show "This model isn't available".
+- An `effort` the chosen model doesn't support is refused the same way.
+- An effort given without a model isn't checked.
+- If the app version can't list its models, nothing is checked.
+
+On the Claude side the bridge never picks a model: a Claude chat only joins with a code, and it keeps the model it already has.
 
 ## Install
 
@@ -155,6 +167,7 @@ npm test
 ```
 
 - `scripts/test-git.mjs`: turn diffs (secret exclusion, repos without commits, untracked edits, size cap).
+- `scripts/test-codex.mjs`: model choice for new ChatGPT threads (ids, picker names, unknown models and efforts refused with the list).
 - `scripts/smoke.mjs`: end to end over MCP with two real server processes, the hooks, and a throwaway git repo.
 - `scripts/test-link.mjs`: links, reviews, hooks, error notes, pruning and broker ownership handover.
 - `scripts/test-install.mjs`: install, reinstall and uninstall against throwaway config directories.
