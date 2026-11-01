@@ -43,7 +43,7 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 - **ChatGPT:** the whole message goes into the thread's own queue, through the app's bundled `codex app-server`. `codex://threads/wake/<id>` then makes the desktop app run it. The user reads both sides in that chat:
   - each incoming message starts with its sender (`CLAUDE:`) and ends with a fixed line saying it is an agent message, not a user instruction;
   - after `bridge_advise` or `bridge_send`, the chat is told to write what it sent as its reply.
-- **Claude Code:** a short notice wakes the session, which reads the message with `bridge_receive`. A background hook with `asyncRewake` exits 2 when something arrives for that session. It is re-armed on every `Stop` and `SessionStart`, so it survives restarts without the model doing anything.
+- **Claude Code:** a background hook with `asyncRewake` exits 2 when something arrives for that session, and wakes it with the whole message in the same format. It is re-armed on every `Stop` and `SessionStart`, so it survives restarts without the model doing anything. If a wake ever looks cut off, `bridge_receive` with its id returns the message in full.
 
 **Identity.** The bridge learns which chat is calling from the host itself: `CLAUDE_CODE_SESSION_ID` on the Claude side and `_meta.threadId` on the ChatGPT side. It never relies on the model remembering, so context compaction can't break a link.
 
@@ -56,7 +56,7 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 | Advisor | The primary is woken, and its next turn is reviewed again. | Nits wait for the user's next prompt; without nits nothing is sent. |
 | One-off review | The answer goes back; the primary asks for the next round with `bridge_review(round_of=…)`: same reviewer, same kind, "Round N" in the request. | The answer goes back; the review is done. |
 
-An emergency cap stops two agents looping: after 20 rounds in a row without approval (`PEER_BRIDGE_MAX_ROUNDS`), a review can't be continued, and an advisor's primary is told once to stop and ask the user and isn't reviewed again until the user writes. In advisor mode a new user prompt starts the count over; answers to turns from before it no longer steer. Repeated nits are dropped.
+An emergency cap stops two agents looping: after 20 rounds in a row without approval (`PEER_BRIDGE_MAX_ROUNDS`), a review can't be continued, and an advisor's primary is told once to stop and ask the user and isn't reviewed again until the user writes. In advisor mode a new user prompt starts the count over. An answer to a turn from before it no longer steers the loop: it doesn't wake the primary or count as a round, but it comes once with the user's next prompt, marked as about an earlier turn (a plain approval stays silent). Repeated nits are dropped.
 
 **Problems are visible.** These problems show up in the affected chat's next prompt, and in `bridge_status`:
 
@@ -72,10 +72,11 @@ An emergency cap stops two agents looping: after 20 rounds in a row without appr
 | `bridge_link` | Make this chat a primary whose every turn is reviewed. From Claude, `advisor="openai"` creates a new ChatGPT advisor thread, running read-only, where you can pick the `model` and reasoning `effort`. `advisor="join"` returns a code that any existing chat can use. |
 | `bridge_review` | Ask for a one-off review of a `request`. The chat's own uncommitted changes are attached; on the ChatGPT side they are attached only when the project folder is known. From Claude, `reviewer="openai"` opens a new ChatGPT thread (for example `model="gpt-6-luna"`, `effort="high"`), or continues in an earlier reviewer's thread with `thread_id`, keeping that chat's context. `reviewer="join"` returns a code. `kind="plan"` reviews a plan instead: no changes attached by default, and the requester waits for the user's approval before building it. `round_of` asks the same reviewer for the next round after `[CHANGES REQUESTED]`. The answer arrives as a new turn. |
 | `bridge_link_join` | Become the advisor or reviewer of a link, using its code. |
-| `bridge_advise` | The advisor's or reviewer's answer: `approved` or `changes_requested`, with must-fix items and nits apart. It names the request it answers (`request_id`, required), so a chat serving several links can't mix them up. A plain message isn't a review request: it is answered with `bridge_send`. |
+| `bridge_advise` | The advisor's or reviewer's answer: `approved` or `changes_requested`, with must-fix items and nits apart. It names the request it answers (`request_id`, required), so a chat serving several links can't mix them up. A plain message isn't a review request: it is answered with `bridge_send` and `reply_to`. |
 | `bridge_unlink` | Close this chat's links. |
 | `bridge_status` | Show this chat's links, their health, whether Claude sides are listening, and pending notes. |
-| `bridge_receive` / `bridge_send` | Read incoming messages. `bridge_send` sends a free-form message to the chat on the other end of this chat's latest link, which is woken to read it. |
+| `bridge_send` | Send a free-form message to the chat on the other end of this chat's latest link, which is woken with it. With `reply_to` (a message id) the answer goes to that message's sender, on its own link. |
+| `bridge_receive` | Read messages still unread, or one by `id` again. Messages normally arrive in full without it. |
 
 ## Install
 
@@ -141,7 +142,7 @@ When an agent starts something with the other side (`bridge_review`, `bridge_lin
 
 ## Known limits
 
-- A ChatGPT thread runs the bridge's messages as prompts. The bridge recognises its own by their exact text, once each. If you paste one of them verbatim before the bridge's own turn for it runs, your paste counts as the bridge's and the real delivery as yours, which only restarts the fix-loop count.
+- A ChatGPT thread runs the bridge's messages as prompts. The bridge recognises its own by their exact text, once each; if the app ever changes the text slightly (line endings, spacing), the message's own first line plus the fixed agent-message line still identify it, so the fix-loop cap holds. If you paste one of them verbatim before the bridge's own turn for it runs, your paste counts as the bridge's and the real delivery as yours, which only restarts the fix-loop count.
 - A Claude Code session can only be woken while it is open in Claude Desktop. Reviews for a closed advisor session wait until it opens, and the primary is told.
 - The Claude listener stops after 12 hours without activity. It re-arms with the next turn of that session.
 - Advisor and reviewer threads that the bridge creates in ChatGPT run read-only. A chat that joins with a code keeps its own permissions; it is only told not to act on the project.

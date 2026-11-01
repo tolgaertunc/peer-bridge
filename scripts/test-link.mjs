@@ -92,8 +92,10 @@ const adv = await call("advise", { endpoint: GPT, requestId: req.id, decision: "
 assert.equal(adv.delivered, "now");
 r = await listener;
 assert.equal(r.code, 2, "listener must exit 2 to wake Claude");
-assert.match(r.err, /flagged your last turn/);
-console.log(`3 concern → Claude listener exited 2: ${r.err.split("\n")[0].slice(0, 90)}…`);
+assert.match(r.err, /flagged your last turn[\s\S]*\[CHANGES REQUESTED\][\s\S]*Parser drops the last token\./, "the Claude session is woken with the advice in full");
+await until(() => state().messages.find((m) => m.id === adv.id).readAt);
+assert.match((await call("receive", { side: "claude", endpoint: CLAUDE, id: adv.id })).messages[0].text, /Parser drops the last token/, "readable again by id");
+console.log(`3 concern → Claude listener exited 2 with the advice in full:${r.err.split("\n")[0].slice(0, 90)}…`);
 
 // 4. the fix loop: the turn after an advisory is reviewed again
 const before = state().messages.length;
@@ -132,7 +134,7 @@ r = await runHook("openai", "stop", { session_id: GPT.id, turn_id: "t9", last_as
 assert.equal(r.out, "");
 r = await advisorListener;
 assert.equal(r.code, 2);
-assert.match(r.err, /Review request/);
+assert.match(r.err, /Review request[\s\S]*User's message:\nWrite a reversible migration\./, "the Claude advisor is woken with the request in full");
 const gptReq = await until(() => state().messages.find((m) => m.kind === "review-request" && m.linkId === l2.id));
 assert.match(gptReq.text, /User's message:\nWrite a reversible migration\./);
 await call("advise", { endpoint: CLAUDE2, requestId: gptReq.id, decision: "changes_requested", blocking: [{ title: "Migration is not reversible." }] });
@@ -183,7 +185,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   await call("advise", { endpoint: REV, requestId: got.messages[0].id, decision: "approved" });
   r = await requester;
   assert.equal(r.code, 2);
-  assert.match(r.err, /review you asked for is ready/);
+  assert.match(r.err, /The review you asked for/);
   assert.equal(state().links[rl.id].active, false);
   console.log("10 one-off review: answer woke the requester, link closed (also when simply approved)");
 }
@@ -432,9 +434,29 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   await prompt("u3", "Actually, do something else.");
   await until(() => state().links[l.id].generation > pending.generation);
   const late = await call("advise", { endpoint: A, requestId: pending.id, decision: "changes_requested", blocking: [{ title: "old" }] });
-  assert.ok(late.stale && late.delivered === "none", "an answer from before the user's latest prompt doesn't steer");
+  assert.ok(late.stale && late.delivered === "next prompt", "an answer from before the user's latest prompt doesn't steer, but isn't lost");
+  assert.equal(state().links[l.id].rounds, 0, "nor does it count as a round");
+  // it comes once, with the next prompt, marked as about an older turn
+  r = await prompt("u4", "Next.");
+  assert.match(JSON.parse(r.out).hookSpecificOutput.additionalContext, /On an earlier turn, before your latest prompt\. For information[^\n]*\n\n\[CHANGES REQUESTED\][\s\S]*- old/);
+  await until(() => state().notes.filter((n) => n.linkId === l.id).every((n) => n.deliveredAt));
+  r = await prompt("u5", "Again.");
+  assert.doesNotMatch(r.out, /On an earlier turn/, "delivered once");
+  // the same late answer again isn't noted twice; a late plain approval stays
+  // silent, one with nits is noted
+  const lateAnswer = async (turn, answer) => {
+    await stopTurn(turn);
+    const req = await openReq();
+    await prompt(`${turn}-next`, "Moving on.");
+    await until(() => state().links[l.id].generation > req.generation);
+    return call("advise", { endpoint: A, requestId: req.id, ...answer });
+  };
+  const again = await lateAnswer("u6", { decision: "changes_requested", blocking: [{ title: "old" }] });
+  assert.ok(again.dup && again.delivered === "none");
+  assert.equal((await lateAnswer("u7", { decision: "approved" })).delivered, "none");
+  assert.equal((await lateAnswer("u8", { decision: "approved", nits: [{ title: "rename" }] })).delivered, "next prompt");
   delete process.env.PEER_BRIDGE_MAX_ROUNDS;
-  console.log("21 advisor loop: bridge prompts don't reset, user prompts do; stop at the cap, no reviews until the user writes; stale answers ignored");
+  console.log("21 advisor loop: bridge prompts don't reset, user prompts do; stop at the cap, no reviews until the user writes; late answers come once as a note");
 }
 
 // 22. telling the bridge's prompts from the user's: exact text, once per
@@ -586,6 +608,24 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   await call("link_close", { linkId: a.id });
   await assert.rejects(call("send", { endpoint: S, text: "hi", linkId: a.id }), /no longer open for this chat; try again/);
   console.log("26 bridge_send: to the checked link, not a newer one; refused if it closed meanwhile");
+}
+
+// 27. a bridge prompt that comes back slightly changed (CRLF line ends, a
+// trailing newline) still counts as the bridge's, so the round cap holds; a
+// header alone is still the user's
+{
+  const P = { app: "openai", id: "gpt-crlf" };
+  const A = { app: "claude", id: "claude-crlf-advisor" };
+  const l = await call("link_create", { primary: P, advisor: A });
+  await call("turn_start", { endpoint: P, turnId: "u1", prompt: "Go." });
+  await call("turn_end", { endpoint: P, turnId: "u1", lastMessage: "done" });
+  const req = state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id);
+  const adv = await call("advise", { endpoint: A, requestId: req.id, decision: "changes_requested", blocking: [{ title: "no" }] });
+  const delivered = inlineText(state().messages.find((m) => m.id === adv.id));
+  assert.ok(!(await call("turn_start", { endpoint: P, turnId: "u2", prompt: delivered.split("\n")[0] })).fromBridge, "a header alone is the user's");
+  assert.ok((await call("turn_start", { endpoint: P, turnId: "b1", prompt: delivered.replace(/\n/g, "\r\n") + "\r\n" })).fromBridge, "changed line ends: still the bridge's");
+  await call("link_close", { linkId: l.id });
+  console.log("27 a bridge prompt with changed line ends still counts as the bridge's; a header alone doesn't");
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
