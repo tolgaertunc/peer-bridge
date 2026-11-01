@@ -628,5 +628,24 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   console.log("27 a bridge prompt with changed line ends still counts as the bridge's; a header alone doesn't");
 }
 
+// 28. a long wake reaches the Claude session whole, down to its final
+// instruction line, and only then counts as read
+{
+  const G = { app: "openai", id: "gpt-long" };
+  const C = { app: "claude", id: "claude-long-advisor" };
+  const l = await call("link_create", { primary: G, advisor: C });
+  const listener = runHook("claude", "listen", { session_id: C.id });
+  await sleep(1200);
+  await call("turn_end", { endpoint: G, turnId: "big", lastMessage: "a".repeat(9_000), diff: `diff --git a/x b/x\n${"+line of the diff\n".repeat(1_100)}` });
+  const req = state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id);
+  r = await listener;
+  assert.equal(r.code, 2);
+  assert.ok(r.err.length > 25_000, `the whole wake arrived (${r.err.length} characters)`);
+  assert.ok(r.err.trimEnd().endsWith(`answer once with bridge_advise (request_id ${req.id}).`), "down to its last line");
+  await until(() => state().messages.find((m) => m.id === req.id).readAt);
+  await call("link_close", { linkId: l.id });
+  console.log(`28 a long wake (${r.err.length} characters) arrives whole, then counts as read`);
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);

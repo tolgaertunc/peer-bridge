@@ -143,10 +143,13 @@ if (event === "listen") {
     const state = readState();
     const pending = pendingFor(state, endpoint);
     if (pending.length) {
-      writeOutbox("wake_ack", { ids: pending.map((m) => m.id) });
       fs.rmSync(file, { force: true }); // the woken turn's Stop re-arms
+      // the whole message, flushed before exit (stderr to a pipe is
+      // asynchronous on macOS and Linux, so a long wake could be cut off),
+      // and only then marked read
+      await new Promise((resolve) => process.stderr.write(pending.map(claudeWakeText).join("\n\n"), resolve));
+      writeOutbox("wake_ack", { ids: pending.map((m) => m.id) });
       hookLog({ woke: pending.map((m) => m.id) });
-      process.stderr.write(pending.map(claudeWakeText).join("\n\n"));
       process.exit(2);
     }
     if (!linked(state) || Date.now() - me.startedAt > LISTEN_MAX_MS) {
