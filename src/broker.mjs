@@ -562,7 +562,9 @@ class BrokerState {
       return { on: false };
     }
     const prev = this.s.auto?.[key];
-    const entry = { ...(prev ?? { paths: {}, turns: 0 }), on: true, since: prev?.on ? prev.since : Date.now() };
+    // turned on again after it was off: a fresh start, with a new reviewer
+    // chat (unless one is named) and the paths as they are now
+    const entry = prev?.on ? { ...prev } : { paths: {}, turns: 0, on: true, since: Date.now(), thread: null };
     if (thread !== undefined) entry.thread = thread;
     if (model !== undefined) entry.model = model;
     if (effort !== undefined) entry.effort = effort;
@@ -589,12 +591,20 @@ class BrokerState {
 
   approvePaths(link) {
     const entry = this.s.auto?.[autoKey(link.primary)];
-    if (!entry?.on) return;
+    // a late answer to a review asked before auto mode was turned off and on
+    // again doesn't touch the new session's paths
+    if (!entry?.on || link.autoSince !== entry.since) return;
     for (const p of link.reqPaths ?? []) {
       // content changed while the review ran, or couldn't be read: nothing new is approved
       if (!p.fp) continue;
       entry.paths[p.path] = { approved: p.fp, base: p.head ?? entry.paths[p.path]?.base ?? null };
     }
+  }
+
+  // which auto mode session a review belongs to, if any
+  autoSession(endpoint) {
+    const entry = this.s.auto?.[autoKey(endpoint)];
+    return entry?.on ? entry.since : null;
   }
 
   // a review was asked for: the reminder count starts over
@@ -654,6 +664,7 @@ class BrokerState {
       if (plan) link.plan = true; // a plan to review, not code
       if (plan && noGate) link.noGate = true; // an auto-mode consult the agent started
       if (reqPaths?.length) link.reqPaths = reqPaths; // what an approval covers
+      link.autoSince = this.autoSession(primary);
     } else link.generation = 0; // bumped by each real user prompt
     this.s.links[id] = link;
     if (mode === "review") this.registerPaths(primary, reqPaths);
@@ -715,6 +726,7 @@ class BrokerState {
     if (prev.plan) link.plan = true;
     if (prev.noGate) link.noGate = true;
     if (reqPaths?.length) link.reqPaths = reqPaths;
+    link.autoSince = this.autoSession(primary);
     link.request = `${heading}\n\n${request}`.slice(0, MAX_TEXT - 500);
     this.s.links[id] = link;
     this.registerPaths(primary, reqPaths);

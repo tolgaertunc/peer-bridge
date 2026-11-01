@@ -124,7 +124,7 @@ Auto mode is for working with a second model throughout, without reviewing every
 - **A gentle reminder** after five of your messages without a review, if nothing is waiting.
 - **Plans:** a plan review the agent starts on its own in auto mode goes on once the reviewer approves it. A plan review you asked for still waits for your approval. This is an instruction to the agent, not a lock.
 
-The work can span several folders or files, git or not, for example an iOS repo and then the same feature in the Android repo from the same chat. Each review names them, and the end-of-turn check covers every folder or file named in a review or when auto mode was turned on. A folder the agent never names isn't checked. Say "auto mode off" to stop.
+The work can span several folders or files, git or not, for example an iOS repo and then the same feature in the Android repo from the same chat. Each review names them, and the end-of-turn check covers every folder or file named in a review or when auto mode was turned on. A folder the agent never names isn't checked. Say "auto mode off" to stop; turning it on again starts fresh, with a new reviewer chat.
 
 ## Your rules
 
@@ -249,7 +249,7 @@ npm test
 | `scripts/test-platform.mjs` | Finding the apps' bundled CLIs. |
 | `scripts/smoke.mjs` | End to end over MCP: two real server processes, the hooks, a throwaway git repo. |
 | `scripts/test-link.mjs` | Links, reviews and rounds, the fix loop, hooks, rules, auto mode's approvals and end-of-turn check, pruning, broker handover. |
-| `scripts/test-failure.mjs` | When no answer is coming: failed ChatGPT turns and the 6-hour watch, Claude's `StopFailure`, usage limits, time-limited app-server calls. |
+| `scripts/test-failure.mjs` | When no answer is coming: failed ChatGPT turns and the 6-hour watch, Claude's `StopFailure`, usage limits, time-limited app-server calls, auto mode's fresh start. |
 | `scripts/test-install.mjs` | Install, reinstall and uninstall against throwaway config folders. |
 | `scripts/test-doctor.mjs` | `doctor` on a missing install, untrusted Codex hooks, the rules file. |
 

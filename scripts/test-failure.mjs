@@ -381,6 +381,25 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   console.log("11 a review taken with bridge_receive is covered by StopFailure; a Stop blocked by auto mode doesn't settle it");
 }
 
+// 12. auto mode turned on again starts fresh, and a late approval from the
+// earlier session leaves the new one's paths alone
+{
+  const A = { app: "claude", id: "claude-fail-auto" };
+  await call("auto_set", { endpoint: A, on: true, thread: "old-thread", paths: [{ path: "/x", fp: "f1", head: "h1" }] });
+  const { id } = await call("link_create", { primary: A, advisor: GPT, mode: "review", request: "Old session.", reqPaths: [{ path: "/x", fp: "f2", head: "h2" }] });
+  await call("auto_set", { endpoint: A, on: false });
+  await sleep(5);
+  const fresh = await call("auto_set", { endpoint: A, on: true });
+  assert.equal(fresh.thread, null, "a new reviewer chat");
+  assert.deepEqual(fresh.paths, {}, "paths as they are now");
+  await call("advise", { endpoint: GPT, requestId: reqOf(id).id, decision: "approved" });
+  assert.deepEqual(state().auto["claude:claude-fail-auto"].paths, {}, "the old session's approval doesn't land here");
+  const kept = await call("auto_set", { endpoint: A, on: true, thread: "t2" });
+  assert.equal((await call("auto_set", { endpoint: A, on: true })).thread, "t2", "turning it on while on keeps the chat");
+  assert.equal(kept.since, fresh.since);
+  console.log("12 auto mode on again starts fresh; a late approval from before doesn't touch it");
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("\nfailure tests passed");
 process.exit(0);
