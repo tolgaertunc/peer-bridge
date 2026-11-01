@@ -678,5 +678,70 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   console.log("29 advisor: the approval that ends a fix loop comes with the next prompt; routine approvals stay silent");
 }
 
+// 30. one turn, many prompt hooks: Claude Code runs UserPromptSubmit with the
+// running turn's prompt_id for a message typed mid-turn and for its own
+// background-task notice (measured). They keep the turn's task and baseline
+// and don't start a generation; the user's message is added to the task.
+// Only equal, present ids count as one turn.
+{
+  const { turnFile } = await import("../src/broker.mjs");
+  const P = { app: "claude", id: "claude-mid-turn" };
+  const l = await call("link_create", { primary: P, advisor: { app: "openai", id: "gpt-mid-turn" } });
+  const link = () => state().links[l.id];
+  const prompt = async (prompt_id, text) => {
+    const n = fs.readdirSync(path.join(dir, "outbox")).length;
+    await runHook("claude", "prompt", { session_id: P.id, prompt: text, ...(prompt_id && { prompt_id }) });
+    await until(() => fs.readdirSync(path.join(dir, "outbox")).length <= n); // processed
+  };
+  const base = () => JSON.parse(fs.readFileSync(turnFile(P), "utf8"));
+  const review = async (prompt_id, answer) => {
+    await runHook("claude", "stop", { session_id: P.id, last_assistant_message: answer, ...(prompt_id && { prompt_id }) });
+    return (await until(() => state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id && m.text.includes(answer)))).text;
+  };
+  const notice = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>";
+
+  await prompt("t1", "Build the importer.");
+  const g = link().generation;
+  const b1 = base();
+  assert.equal(b1.turnId, "t1");
+  await prompt("t1", notice);
+  await prompt("t1", "Be quick.");
+  await prompt("t1", notice);
+  assert.equal(link().generation, g, "mid-turn messages and notices start no generation");
+  assert.deepEqual(base(), b1, "the turn's baseline is kept");
+  let text = await review("t1", "Importer built.");
+  assert.match(text, /User's message:\nBuild the importer\.\n\nAdded by the user while the turn was running:\nBe quick\.\n\nPrimary's final message/);
+  assert.ok(!text.includes("task-notification"), "the app's notices aren't the user's");
+
+  // a turn the app's notice starts (idle session) isn't the user's either
+  await prompt("t2", notice);
+  assert.equal(link().generation, g, "a notice starts no generation");
+  text = await review("t2", "Noted the task.");
+  assert.match(text, /User's message:\n\(None: the app started this turn/);
+
+  // an interrupted turn (no Stop) followed by a new task: the new id gets a
+  // new baseline and only its own message
+  await prompt("t3", "Task A.");
+  const b3 = base();
+  await prompt("t4", "Task B.");
+  assert.equal(base().turnId, "t4");
+  assert.ok(base().at >= b3.at);
+  assert.equal(link().generation, g + 2);
+  text = await review("t4", "Did B.");
+  assert.match(text, /User's message:\nTask B\.\n\nPrimary's final message/);
+
+  // without ids every prompt is a new turn, as before
+  await prompt(null, "First.");
+  const b5 = base();
+  await sleep(5);
+  await prompt(null, "Second.");
+  assert.notDeepEqual(base(), b5, "no id: new baseline");
+  assert.equal(link().generation, g + 4);
+  text = await review(null, "Did both.");
+  assert.match(text, /User's message:\nSecond\.\n\nPrimary's final message/);
+  await call("link_close", { linkId: l.id });
+  console.log("30 mid-turn: messages typed during a turn join its task, notices are ignored, the baseline holds; new or missing ids start a turn");
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);
