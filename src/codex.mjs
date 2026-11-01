@@ -42,7 +42,7 @@ export class AppServer {
       if (m.id != null && this.pending.has(m.id)) {
         const { resolve, reject } = this.pending.get(m.id);
         this.pending.delete(m.id);
-        m.error ? reject(new Error(`${m.error.message ?? JSON.stringify(m.error)}`)) : resolve(m.result);
+        m.error ? reject(Object.assign(new Error(`${m.error.message ?? JSON.stringify(m.error)}`), { code: m.error.code })) : resolve(m.result);
       } else if (m.method) for (const l of this.listeners) l(m);
     });
   }
@@ -80,25 +80,78 @@ async function withServer(fn, opts) {
   }
 }
 
+export class ModelChoiceError extends Error {}
+
+// What an app-server without the method answers (measured: -32600 "unknown
+// variant `model/list`"; -32601 is JSON-RPC's own "method not found")
+const unsupported = (e) => e.code === -32601 || /unknown variant `model\/list`|method not found|unknown method/i.test(e.message);
+
+// The models this account can use, in the app's own order (hidden ones too, so
+// a name typed exactly still works); null only when this app version has no
+// model list. Any other failure stops the thread from being made: unchecked,
+// a wrong name would make a thread that can't run.
+async function listModels(s) {
+  const models = [];
+  let cursor = null;
+  try {
+    do {
+      const r = await s.rpc("model/list", { includeHidden: true, ...(cursor && { cursor }) });
+      if (!Array.isArray(r?.data)) throw new Error("unexpected answer");
+      models.push(...r.data);
+      cursor = r.nextCursor;
+    } while (cursor);
+  } catch (e) {
+    if (!models.length && !cursor && unsupported(e)) return null;
+    throw new ModelChoiceError(`Nothing was created: ChatGPT's model list couldn't be read (${e.message}). Try again, or leave out the model to use ChatGPT's default.`);
+  }
+  return models;
+}
+
+const sameName = (a, b) => typeof a === "string" && a.trim().toLowerCase().replace(/\s+/g, "-") === b.trim().toLowerCase().replace(/\s+/g, "-");
+
+// The app's id for a chosen model (its id, or its display name as shown in the
+// picker), checked before a thread is made: thread/start takes any name, and
+// the thread then only says "This model isn't available". An effort the model
+// doesn't offer is refused the same way.
+export function pickModel(models, model, effort) {
+  if (!models || !model) return model;
+  const m = models.find((x) => [x.id, x.model, x.displayName].some((n) => sameName(n, model)));
+  if (!m) {
+    const names = models.filter((x) => !x.hidden).map((x) => `${x.model} (${x.displayName})`);
+    throw new ModelChoiceError(
+      `Nothing was created: ChatGPT has no model "${model}". Its models: ${names.join(", ")}. ` +
+        "Call again with one of these; if the user's choice isn't clearly one of them, ask the user.",
+    );
+  }
+  const efforts = (m.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort);
+  if (effort && efforts.length && !efforts.includes(effort))
+    throw new ModelChoiceError(`Nothing was created: ${m.model} has no effort "${effort}". Its efforts: ${efforts.join(", ")}.`);
+  return m.model;
+}
+
 // New named thread with a chosen model, without running a model turn
 // (`inject_items` is what makes a turn-less thread persist)
 // (`effort` is set both as a config override and as a thread setting, so it
 // holds whichever the desktop app picks up when it resumes the thread)
-export function createThread({ model, effort, cwd, name, seed, sandbox }, opts) {
-  return withServer(async (s) => {
-    const r = await s.rpc("thread/start", {
-      model: model ?? null,
-      cwd: cwd ?? process.cwd(),
-      sandbox: sandbox ?? null,
-      ...(effort && { config: { model_reasoning_effort: effort } }),
-    });
-    const threadId = r.thread.id;
-    if (effort) await s.rpc("thread/settings/update", { threadId, effort });
-    const text = seed ?? "This thread is driven by peer-bridge.";
-    await s.rpc("thread/inject_items", { threadId, items: [{ type: "message", role: "developer", content: [{ type: "input_text", text }] }] });
-    if (name) await s.rpc("thread/name/set", { threadId, name });
-    return { threadId, model: r.model };
-  }, opts);
+export function createThread(args, opts) {
+  return withServer((s) => createThreadOn(s, args), opts);
+}
+
+// (on a given app-server session, so tests can stand one in)
+export async function createThreadOn(s, { model, effort, cwd, name, seed, sandbox }) {
+  if (model) model = pickModel(await listModels(s), model, effort);
+  const r = await s.rpc("thread/start", {
+    model: model ?? null,
+    cwd: cwd ?? process.cwd(),
+    sandbox: sandbox ?? null,
+    ...(effort && { config: { model_reasoning_effort: effort } }),
+  });
+  const threadId = r.thread.id;
+  if (effort) await s.rpc("thread/settings/update", { threadId, effort });
+  const text = seed ?? "This thread is driven by peer-bridge.";
+  await s.rpc("thread/inject_items", { threadId, items: [{ type: "message", role: "developer", content: [{ type: "input_text", text }] }] });
+  if (name) await s.rpc("thread/name/set", { threadId, name });
+  return { threadId, model: r.model };
 }
 
 // Queue a prompt for the desktop app and make sure it picks it up
