@@ -50,6 +50,8 @@ const MAX_ROUNDS = () => {
   return Number.isInteger(n) && n > 0 ? n : 20; // a typo mustn't turn the stop off
 };
 const DAY = 24 * 3600_000;
+// bridge_status shows closed links only from the last hour, at most this many
+const STATUS_RECENT = { ms: 3600_000, count: 5 };
 // free-form peer messages (bridge_send) can ping-pong; links can't
 const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
 // How long the bridge follows a prompt queued for a ChatGPT thread, to tell
@@ -523,12 +525,20 @@ class BrokerState {
   op_status({ endpoint } = {}) {
     const s = this.s;
     const mine = (l) => !endpoint || sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint);
+    // open links, and the few that closed in the last hour (a review that
+    // was just answered); older ones are only counted
+    const all = Object.values(s.links).filter(mine);
+    const open = all.filter((l) => l.active);
+    const recent = all
+      .filter((l) => !l.active && Date.now() - (l.closedAt ?? l.createdAt) < STATUS_RECENT.ms)
+      .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0))
+      .slice(0, STATUS_RECENT.count);
     return {
       messages: s.messages.length,
       unread: Object.fromEntries(SIDES.map((x) => [x, s.messages.filter((m) => m.to === x && !m.readAt).length])),
-      links: Object.values(s.links)
-        .filter(mine)
-        .map(({ advisories, lastPrompt, request, ...l }) => ({
+      olderLinks: all.length - open.length - recent.length,
+      links: [...open, ...recent]
+        .map(({ advisories, lastPrompt, request, reqPaths, ...l }) => ({
           ...l,
           advisories: advisories?.length ?? 0,
           lastAdvice: advisories?.at(-1) ?? null,

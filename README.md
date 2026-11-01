@@ -200,7 +200,7 @@ The bridge's MCP tools, for agents. You normally don't call them yourself.
 | `bridge_advise` | Answer a review request: `request_id`, `decision` (`"approved"` or `"changes_requested"`), `note`, `blocking`, `nits`. |
 | `bridge_receive` | Read messages that are still unread, or one again by `id`. Messages normally arrive in full without it. |
 | `bridge_send` | Send a free-form message to the chat on the other end of this chat's latest link. With `reply_to` (a message id) the answer goes to that message's sender, on its own link. |
-| `bridge_status` | This chat's links, their health, whether Claude sessions are listening, ChatGPT's usage limits, and the last observed failure of linked chats. |
+| `bridge_status` | This chat's open links and up to 5 closed in the last hour (older ones are only counted), their health, whether Claude sessions are listening, ChatGPT's usage limits, and the last observed failure of linked chats. |
 | `bridge_unlink` | Close this chat's links. |
 
 `bridge_review`, `bridge_link` and `bridge_send` also take `open` and `remember`, used only after the user agreed to open a closed app.

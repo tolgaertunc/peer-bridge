@@ -590,7 +590,7 @@ server.registerTool(
   {
     title: "Bridge status",
     description:
-      "Show this chat's links (role, other chat, health, whether Claude sides are listening), pending notes, unread messages, ChatGPT's usage limits, and the last observed failure of linked chats.",
+      "Show this chat's open links and up to 5 closed in the last hour (role, other chat, health, whether Claude sides are listening), pending notes, unread messages, ChatGPT's usage limits, and the last observed failure of linked chats.",
     inputSchema: {},
     annotations: READ_ONLY,
   },
