@@ -23,9 +23,17 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
 
 **Trigger.** A non-blocking `Stop` hook in both apps queues each finished turn of a linked primary for review. It never holds the turn open and never waits. The review request contains:
 
-- the user's message for that turn,
+- the user's message for that turn, followed by anything the user typed while the turn was running,
 - the primary's final answer,
 - the git diff of what changed in the working tree during the turn.
+
+Claude Code runs the `UserPromptSubmit` hook again, with the running turn's `prompt_id`, for a message typed mid-turn and for its own notices (a background task finishing). The bridge treats these as part of the running turn:
+
+- the turn's task and diff baseline are kept;
+- the app's notices are left out of the review request;
+- none of them counts as a new user prompt for the fix loop.
+
+Only a new id starts a new turn. A prompt without an id is always treated as a new turn.
 
 **Diff baseline.** The `UserPromptSubmit` hook takes a snapshot when the turn starts, using `git stash create`, which doesn't touch any files or refs.
 

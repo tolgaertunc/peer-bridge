@@ -26,13 +26,19 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 10);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 11);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
 export const HOST_ID = /^local_[A-Za-z0-9-]{1,64}$/;
 const MAX_TEXT = 40_000;
 const MAX_PROMPT = 6_000;
+// Claude Code's notice that a background task finished, delivered through
+// UserPromptSubmit like a prompt (measured)
+const HOST_NOTICE = /^\s*<task-notification>/;
+// Heads what the user typed while a turn was running, in its review request
+const MID_TURN = "Added by the user while the turn was running:";
+const NOTICE_TURN = "(None: the app started this turn with a notice of its own, such as a background task finishing.)";
 const MAX_ANSWER = 10_000;
 export const MAX_DIFF = 20_000;
 const DECISIONS = ["approved", "changes_requested"];
@@ -485,10 +491,22 @@ class BrokerState {
   // From the primary's UserPromptSubmit hook: what the user asked this turn.
   // A real user prompt starts a new generation: the fix-loop count starts
   // over, a stop is lifted, and answers to older requests no longer steer.
+  // The hook also runs, with the running turn's id, for a message the user
+  // types while the turn runs and for the app's own notices (a background
+  // task finished): those belong to the turn and start nothing. Only ids that
+  // are both present and equal count as the same turn.
   op_turn_start({ endpoint, turnId, prompt }) {
     const link = this.linkFor("primary", endpoint, "advisor");
     if (!link || typeof prompt !== "string") return { skipped: "no link" };
-    link.lastPrompt = { turnId: turnId ?? null, text: prompt.slice(0, MAX_PROMPT), at: Date.now() };
+    const notice = HOST_NOTICE.test(prompt);
+    const p = link.lastPrompt;
+    if (turnId && p?.turnId === turnId) {
+      if (notice || this.fromBridge(endpoint, prompt)) return { ok: true, sameTurn: true };
+      p.text = `${p.text}\n\n${MID_TURN}\n${prompt}`.slice(0, MAX_PROMPT);
+      return { ok: true, sameTurn: true };
+    }
+    link.lastPrompt = { turnId: turnId ?? null, text: notice ? NOTICE_TURN : prompt.slice(0, MAX_PROMPT), at: Date.now() };
+    if (notice) return { ok: true, notice: true };
     if (this.fromBridge(endpoint, prompt)) return { ok: true, fromBridge: true };
     Object.assign(link, { generation: (link.generation ?? 0) + 1, rounds: 0, stopped: false });
     return { ok: true };

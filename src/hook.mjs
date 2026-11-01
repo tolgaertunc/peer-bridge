@@ -85,9 +85,23 @@ if (event === "prompt") {
   // the user's message goes into this turn's review request, so the advisor
   // sees what was asked and not just the answer
   if (advisedPrimary(state)) {
-    if (input.prompt) writeOutbox("turn_start", { endpoint, turnId: input.turn_id ?? input.prompt_id ?? null, prompt: input.prompt });
-    const base = input.cwd ? baseline(input.cwd) : null;
-    if (base) fs.writeFileSync(turnFile(endpoint), JSON.stringify({ ...base, at: Date.now() }));
+    const turnId = input.turn_id ?? input.prompt_id ?? null;
+    if (input.prompt) writeOutbox("turn_start", { endpoint, turnId, prompt: input.prompt });
+    // a message typed while the turn runs, or the app's own notice, comes with
+    // the running turn's id: the turn's changes still count from its start.
+    // Any other prompt starts a new baseline, and a leftover one from a turn
+    // that never reached Stop is dropped.
+    let prev = null;
+    try {
+      prev = JSON.parse(fs.readFileSync(turnFile(endpoint), "utf8"));
+    } catch {
+      // no turn running
+    }
+    if (!turnId || prev?.turnId !== turnId) {
+      const base = input.cwd ? baseline(input.cwd) : null;
+      if (base) fs.writeFileSync(turnFile(endpoint), JSON.stringify({ ...base, turnId, at: Date.now() }));
+      else fs.rmSync(turnFile(endpoint), { force: true });
+    }
   }
   const notes = (state?.notes ?? []).filter((n) => sameEndpoint(n.to, endpoint) && !n.deliveredAt);
   if (notes.length) writeOutbox("notes_ack", { ids: notes.map((n) => n.id) });
